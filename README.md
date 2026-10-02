@@ -12,6 +12,7 @@ A focused Tampermonkey userscript by **naXim Labs** that makes Wallhaven galleri
 - Show resolution, category, and favorite-count metadata.
 - Detect cards added dynamically after filtering or pagination.
 - Keep requests rate-conscious with an in-memory metadata cache.
+- AND MUCH MORE !!!
 
 ## Installation with Tampermonkey
 
