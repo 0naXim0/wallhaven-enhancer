@@ -1,6 +1,6 @@
 # Wallhaven Enhancer
 
-A focused Tampermonkey userscript by **naXim Labs** that makes Wallhaven galleries faster to explore. It adds instant full-resolution previews, wallpaper metadata, direct original-file downloads, and keyboard browsing without replacing Wallhaven’s native pages.
+A focused Tampermonkey userscript by **naXim Labs** (v7.3.1) that makes Wallhaven galleries faster to explore. It adds instant full-resolution previews, wallpaper metadata, direct original-file downloads, and keyboard browsing without replacing Wallhaven’s native pages.
 
 ## Features
 
@@ -52,7 +52,7 @@ The same CDN URL is embedded in the script’s `@downloadURL` and `@updateURL` m
 
 ## Releases
 
-Stable downloadable packages are published in the repository’s [Releases](https://github.com/0naXim0/wallhaven-enhancer/releases) tab. The source userscript is also kept at the repository root so it is easy to inspect, fork, and update.
+The current stable v7.3.1 package and direct `.user.js` download are published in the repository’s [Releases](https://github.com/0naXim0/wallhaven-enhancer/releases) tab. The source userscript is also kept at the repository root so it is easy to inspect, fork, and update.
 
 ## Permissions and privacy
 

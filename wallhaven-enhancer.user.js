@@ -3,11 +3,11 @@
 // @namespace    https://github.com/0naXim0
 // @author       naXim Labs (0naXim0)
 // @homepageURL  https://github.com/0naXim0
-// @supportURL   https://github.com/0naXim0
 // @downloadURL  https://cdn.jsdelivr.net/gh/0naXim0/wallhaven-enhancer@main/wallhaven-enhancer.user.js
 // @updateURL    https://cdn.jsdelivr.net/gh/0naXim0/wallhaven-enhancer@main/wallhaven-enhancer.user.js
-// @version      7.1.2
-// @description  Byte-accurate circular download progress with cancellation and automatic retry, tag-based filenames, instant previews, persistent HD Mode, smooth zoom & pan, hover card actions with native favorites and release dates, unified card design, adaptive bounded batch scanning. A naXim Labs product.
+// @supportURL   https://github.com/0naXim0
+// @version      7.3.1
+// @description  Byte-accurate downloads, instant previews, persistent HD Mode, smooth zoom & pan, unified cards, adaptive scanning, and a server-verified favorite/collection system with true add/remove semantics, a per-collection Quick-Save target and a hold-to-open collection picker. A naXim Labs product.
 // @match        https://wallhaven.cc/*
 // @run-at       document-end
 // @noframes
@@ -17,12 +17,149 @@
 // @grant        GM_getValue
 // @grant        GM_deleteValue
 // @grant GM_download
+// @grant GM_addValueChangeListener
 // @connect      wallhaven.cc
 // @connect      w.wallhaven.cc
 // @connect      th.wallhaven.cc
 // ==/UserScript==
 
 // ════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
+//  v7.3.1 — GLOBAL KILL: WALLHAVEN'S NATIVE CORNER STAR
+//
+//  THE glitch: wallhaven renders its own corner anchor — a.thumb-btn —
+//    on every thumbnail for signed-in users. Any wallpaper you have
+//    favorited gets the .thumb-btn-unfav variant: a solid GREEN (#490)
+//    rounded square with a white star, pinned to the TOP-RIGHT corner
+//    at opacity 1, straight from the server HTML. It is ALWAYS visible
+//    — Latest, Top, Hot, and every account collections tab — before
+//    any hover happens.
+//
+//  WHY it flickered: the enhancer already replaces wallhaven's per-card
+//    chrome with its own (the hover nx-tools rail + the .nx-fav star in
+//    the bottom info bar), but the card sanitizer only ran LAZILY, on a
+//    card's first pointerenter. So an un-hovered card kept showing the
+//    native green corner star; the moment you hovered, it was sanitized
+//    away and stayed hidden until the page was reloaded — and since only
+//    favorited wallpapers render it, its appearance looked random.
+//
+//  THE fix: one universal stylesheet rule, injected with the script's
+//    very first init step, kills the native corner star pair (.thumb-btn
+//    -fav / .thumb-btn-unfav) on every wallhaven page, for every card —
+//    present at load or added later by infinite scroll — before any
+//    hover, with no dependence on the sanitizer. The enhancer's own star
+//    remains the single favorite affordance, and the removal engine is
+//    untouched (it scrapes quickDelete links from FETCHED documents,
+//    which display:none on the live page cannot reach).
+//
+// ════════════════════════════════════════════════════════════════
+//  v7.3.0 — FAVORITE ENGINE: TRUE ADD/REMOVE SEMANTICS
+//
+//  THE core fix: removal no longer depends on the Quick-Save target.
+//    Every earlier version scraped the removal link from the ACTIVE
+//    Quick-Save collection only — if the wallpaper actually lived in
+//    a different one, tapping the star failed with "did not return
+//    the real removal link". Removal now resolves the wallpaper's
+//    real collections first (the favorite index, or an exhaustive
+//    paginated walk when the index does not know) and removes it
+//    from every collection that holds it.
+//
+//  THE star is a toggle again: already-favorited + tap = remove,
+//    immediately — no picker, no Quick-Save destination involved.
+//    The collection picker now belongs exclusively to the ADD flow
+//    (not favorited + no Quick-Save target, or a deliberate hold).
+//
+//  ONE source of truth (FavState): "is it favorited?" has a single
+//    answer — server .faved seeds plus a cached, count-validated,
+//    fully paginated account index — instead of five DOM
+//    heuristics. Every mutation runs through a per-wallpaper lock
+//    (rapid taps serialize and coalesce; a late response can never
+//    overwrite newer state), and favRender() is the only DOM writer
+//    for star state, so every card instance of a wallpaper agrees.
+//
+//  FIXED under the hood:
+//    • The old boot-time account scan only read page 1 of each
+//      collection, so it overwrote TRUE server state with
+//      incomplete data — wallpapers on page 2+ of their collection
+//      lost their star. It is replaced by the index, which never
+//      downgrades a server marker.
+//    • Scan cards now show real account state (they always rendered
+//      un-favorited before), refreshed by the background index.
+//    • The dead gf_favs local mirror (write-only since v7.1.3) is
+//      deleted — one store, one truth.
+//    • FAV_URL now matches the site's real /wallpaper/fav/{id}
+//      contract (was /favorites/fav/, a route the site never
+//      renders on its cards).
+//    • A rotated CSRF token (HTTP 419) is retried exactly once with
+//      a fresh catalog; add and quickDelete links embed fresh
+//      tokens resolved at operation time.
+//    • Quick-Save target changes made in other tabs propagate live
+//      (GM_addValueChangeListener).
+//    • Restored snapshot grids re-render stars from live state
+//      (clearGrid), and the star's error path always restores the
+//      tooltip (it could stick at the last error message).
+//    • Space activates the star like a button, and picker rows show
+//      a "Saved" chip for collections already holding the wallpaper.
+//
+//  v7.2.0 — QUICK-SAVE & COLLECTION PICKER UX REWORK
+//
+//  NEW: Per-collection Quick-Save controls
+//    Every collection row in the picker now carries its own ⚡
+//    Quick-Save control. Exactly ONE collection may be the target
+//    at any time — a single stored value is the only source of
+//    truth (quickLoad/quickSave), activating one automatically
+//    displaces the previous one, and the whole UI is re-derived
+//    from that value (refreshQuickStates), so two rows can never
+//    appear active or disagree with what a tap on ★ will do.
+//    Tapping the active ⚡ turns Quick-Save off.
+//
+//  NEW: The hold opens the picker the moment the threshold is hit
+//    The deliberate-hold threshold drops from 650 ms to 400 ms,
+//    and the picker opens WHILE the star is still held — an
+//    instant shell with a loading state first, the collection rows
+//    as soon as the account catalog answers. The release that
+//    follows can never fire the normal tap action (time-boxed
+//    suppression window), and a 9 px movement slop plus
+//    pointercancel handling keeps drags, scrolls and ghost clicks
+//    from being mistaken for a deliberate hold.
+//
+//  FIXED: Picker close button behaved like selectable text
+//    The custom modal's close control showed the I-beam cursor
+//    (wallhaven's own CSS omits cursor:pointer on .overlay-close
+//    and its :hover rule targets the icon's children). It is now a
+//    36×36 px pointer-cursor hit area with hover, active and
+//    focus-visible states — and the fix also covers wallhaven's
+//    own overlay dialogs that reuse the same class.
+//
+//  FIXED: Picker content rendered behind the title bar
+//    The modal skipped wh-core's .overlay-content wrapper, whose
+//    51 px top padding clears the absolutely-flowed title bar —
+//    the intro and the first rows sat underneath it. The picker
+//    now mirrors wh-core's scaffold exactly (header + content),
+//    gains Escape-to-close, keyboard-operable controls and a
+//    retry path on load errors.
+//
+//  REMOVED: the settings icon beside the star
+//    The whole feature is gone — icon, handlers, state and CSS.
+//    Its job now lives where it belongs: inside the picker, as
+//    the per-collection ⚡ controls plus the status line that
+//    names the active Quick-Save target. (It was also visually
+//    dead weight: sanitizeCard hid it on every native card.)
+//
+//  FIXED under the hood:
+//    • Restored snapshot cards (clearGrid) lost their star
+//      listeners — cloneNode copies the bound flag but not the
+//      handlers; binding is now guarded by a WeakSet and re-runs
+//      after the native listing is restored.
+//    • The stale data-nxLong DOM flag could swallow one unrelated
+//      click later; suppression is now a short time window instead.
+//    • Star tooltips reflect the live Quick-Save target, and a
+//      quick-save shows loading/success/error feedback on the star.
+//    • Anonymous sessions get an accurate log-in message instead
+//      of a doomed catalog fetch.
+//    • Dead v7.1.1 fallback chain removed (favOnAnchorClick,
+//      favToggleFallback, favRequest, showFavOverlay, unused
+//      helpers) — nothing could reach it since 7.1.3.
 // ════════════════════════════════════════════════════════════════
 //  v7.1.1 — CHANGES FROM v7.1.0 (TRUE ACCOUNT-COLLECTION FAVORITES)
 //
@@ -159,7 +296,7 @@
 
 (function () {
     'use strict';
-    console.info('[naXim Labs] v7.1.2 executing');
+    console.info('[naXim Labs] v7.3.1 executing');
 
     /* ═══ PAGE DETECTION & BOOT GUARD ══════════════════════════════ */
 
@@ -213,6 +350,7 @@
                 set('dateFrom', yf + '-01-01');
                 set('dateTo',   yt + '-12-31');
             }
+            GM_deleteValue('gf_favs');   // v7.3.0: write-only mirror retired
             if (!GM_getValue('gf_sortmig', 0)) {
                 GM_setValue('gf_sortmig', 1);
                 if (GM_getValue('gf_sort', 'favorites') === 'date_added') GM_setValue('gf_sort', 'favorites');
@@ -553,167 +691,73 @@
         } catch { return null; }
     }
 
-    /* ═══ FAVORITES — native mechanism ═════════════════════════════ */
+    /* ═══ FAVORITES & COLLECTIONS — Quick-Save engine ══════════════ */
 
-    const FAV_STORE = 'gf_favs';
-    const savedFavs = safeParse(FAV_STORE);
-    const _favSet = new Set((Array.isArray(savedFavs) ? savedFavs : Object.keys(savedFavs))
-        .map(String).filter(id => /^[a-z0-9]{6}$/i.test(id)));
-    let _favSaveT = 0;
-    function favPersist () {
-        clearTimeout(_favSaveT);
-        _favSaveT = setTimeout(() => {
-            try { GM_setValue(FAV_STORE, JSON.stringify([..._favSet].slice(-FAV_CAP))); } catch {}
-        }, 800);
-    }
-    // Immediate write used by the pagehide flush (favPersist alone is
-    // debounced, so a favorite clicked just before close/reload could
-    // otherwise be lost).
-    favFlush = () => {
-        clearTimeout(_favSaveT);
-        try { GM_setValue(FAV_STORE, JSON.stringify([..._favSet].slice(-FAV_CAP))); } catch {}
-    };
+    /* ─── v7.3.0 favorite / collection engine ─────────────────────
+     *
+     * ARCHITECTURE — exactly one authority per question:
+     *
+     *   "Is this wallpaper favorited?"      → FavState.isOn(id)
+     *   "Which collections hold it?"        → FavState.locsDisplay(id)
+     *   "Where does a NEW save go?"         → the Quick-Save target (quickLoad)
+     *   "Which favorite gets REMOVED?"      → the wallpaper's ACTUAL
+     *                                         collections — never the
+     *                                         Quick-Save target
+     *   "What the star looks like"          → favRender(id) — the only
+     *                                         DOM writer for star state
+     *   "What runs a mutation"              → favRun(id, fn) — strict
+     *                                         per-wallpaper serialization
+     *
+     * Wallhaven contracts this engine is built on (all verified
+     * against the live site):
+     *   • card star <a class="… wall-favs" data-href="/wallpaper/fav/{id}">
+     *     — wh-core GETs that URL, the server toggles the account
+     *       favorite and answers {view, status}.
+     *   • the account's /favorites page renders the collections
+     *     sidebar: .collection[data-collection-id] / #collection-{id}
+     *     with a <small>count</small> each, plus a CSRF _token link.
+     *   • "Default" is an ordinary numeric collection (wallhaven's
+     *     own API lists it first: {id, label:"Default", count}).
+     *   • add    → POST /favorites/add?wallHashid={id}&collectionId=
+     *              {cid}&_token={csrf}
+     *   • remove → GET the /favorites/quickDelete link the
+     *              collection page renders next to the wallpaper.
+     *
+     * v7.3.0 fixes over every earlier version:
+     *   1. Removal no longer consults the Quick-Save target. It
+     *      resolves the wallpaper's real collections (index first,
+     *      exhaustive walk as fallback) and removes it from every
+     *      one that holds it, so it can never fail with "did not
+     *      return the real removal link" just because the active
+     *      Quick-Save collection differs.
+     *   2. The collection picker belongs to the ADD flow only. A
+     *      tap on an already-favorited star removes immediately —
+     *      no modal, no destination selection, whatever Quick-Save
+     *      is set to.
+     *   3. Star state has one source (FavState + favRender) instead
+     *      of five DOM heuristics. Every mutation passes through
+     *      the per-wallpaper lock, so rapid taps serialize instead
+     *      of racing, and no late response can overwrite a newer
+     *      one.
+     *   4. The old boot-time account scan only ever read page 1
+     *      of each collection, so it overwrote true server state
+     *      with incomplete data (wallpapers further down a
+     *      collection lost their star). It is replaced by a cached,
+     *      count-validated, fully paginated index that never
+     *      downgrades the server's own .faved markers.
+     *   5. The local gf_favs mirror (write-only since v7.1.3) is
+     *      deleted — duplicated state without a reader.
+     */
+    const FAV_URL = id => 'https://wallhaven.cc/wallpaper/fav/' + encodeURIComponent(id);
 
     // Wallhaven renders its header Login/Join buttons only for
     // anonymous sessions — that is the reliable logged-out signal on
-    // every wallhaven page (the old '#fav-button' scraper this
-    // replaces targeted markup that no longer exists anywhere).
+    // every wallhaven page.
     function favLoggedOut () {
         try {
             return !!document.querySelector('a.button[href$="/login"], a.button[href$="/join"]');
         } catch { return false; }
     }
-
-    /* FALLBACK favorite toggling — v7.1.0's custom request flow.
-     *
-     * Only used when wh-core's overlay stack is missing (never on
-     * real wallhaven — there the native overlay-anchor flow above
-     * runs the show and this stays dormant). It fires a jQuery GET of
-     *   https://wallhaven.cc/wallpaper/fav/{id}
-     * (the data-href of the native .jsAnchor.overlay-anchor element —
-     * see wh-core: $(document).on('click', '.overlay-anchor', …) →
-     * fetchView → $.get). For a logged-in session the server toggles
-     * the wallpaper in the account's favorites and replies with JSON
-     * { view: <overlay html>, status?: true|false }. wallhaven's own
-     * handler treats "view present and status !== false" as success —
-     * this implementation validates the response exactly the same way
-     * and (v7.1.0) feeds the returned view into the native #overlay
-     * via wh-core's exact show sequence (see showFavOverlay), so the
-     * collections picker modal appears just like v5.4.1 and any
-     * collection the user ticks there is saved to the account by
-     * wallhaven's own delegated handlers.
-     * The stored collection itself lives in the wallhaven account
-     * (exactly like v5.4.1); the gf_favs set below is v7.0.8's local
-     * mirror used to render the correct star state instantly on
-     * reload, with no duplicates (it is a Set of wallpaper ids). */
-    function favRequest (id, desired) {
-        const url = 'https://wallhaven.cc/favorites/fav/' + encodeURIComponent(id);
-        const jq = window.jQuery;
-        if (jq && typeof jq.get === 'function') {
-            return new Promise((res, rej) => {
-                if (favLoggedOut()) { rej(Object.assign(new Error('login required'), { login: true })); return; }
-                jq.get(url)
-                    .done(data => {
-                        /* Defensive: jQuery only auto-parses JSON when the reply's
-                         * Content-Type says json (a proxy/extension can strip it) —
-                         * parse manually in that case so the toggle still works. */
-                        if (typeof data === 'string') { try { data = JSON.parse(data); } catch (e) { /* leave as string */ } }
-                        const view = data && data.view != null ? String(data.view) : '';
-                        if (view && data.status !== false) { res({ ...data, favorited: desired, view }); return; }
-                        const msg = (data && data.msg) || (view ? view.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120) : '');
-                        rej(new Error(msg || 'Wallhaven favorite request failed'));
-                    })
-                    .fail(xhr => {
-                        const login = xhr && /\/login/i.test(xhr.responseURL || '');
-                        rej(Object.assign(new Error(login ? 'login required' : 'network error'), { login }));
-                    });
-            });
-        }
-        // No jQuery (defensive fallback) — same endpoint, same contract.
-        return fetch(url, {
-            method: 'GET', credentials: 'same-origin',
-            headers: {
-                'X-Requested-With': 'XMLHttpRequest',
-                Accept: 'application/json, text/javascript, */*; q=0.01',
-            },
-        }).then(async (r) => {
-            const text = await r.text();
-            if (r.redirected && /\/login/i.test(r.url)) {
-                throw Object.assign(new Error('login required'), { login: true });
-            }
-            if (!r.ok) throw Object.assign(new Error('HTTP ' + r.status), { status: r.status });
-            if (favLoggedOut()) throw Object.assign(new Error('login required'), { login: true });
-            let data = null;
-            try { data = JSON.parse(text); } catch {}
-            const view = data && data.view != null ? String(data.view) : '';
-            if (view && data.status !== false) return { ...data, favorited: desired, view };
-            const msg = (data && data.msg) || '';
-            throw new Error(msg || 'Wallhaven favorite request failed');
-        });
-    }
-
-    /* ─── v7.1.1: the favorite star IS wallhaven's own star ────────
-     *
-     * The upgraded control is no longer a custom <button> speaking a
-     * private protocol — it is the very element wallhaven renders for
-     * its own cards:
-     *     <a class="jsAnchor overlay-anchor wall-favs"
-     *        data-href="https://wallhaven.cc/wallpaper/fav/{id}">
-     * restyled to keep the v7.0.8 look. A click reaches wh-core's own
-     * delegated handler — the exact mechanism v5.4.1 relied on and
-     * the site's native star still uses:
-     *     fetchView(data-href) → $.get('/wallpaper/fav/{id}')
-     *       → the server toggles the favorite server-side,
-     *       → wh-core injects the server's {view} into #overlay: the
-     *         "Add to collection…" modal listing the USER'S OWN
-     *         collections (Default, custom ones, "Manage collections").
-     * Ticking a collection in that modal is executed by wallhaven's
-     * own handlers, which is what really saves the wallpaper into the
-     * chosen account collection. This script fires NO favorite
-     * request of its own on modern wallhaven pages — the modal, the
-     * network calls and the account state are wallhaven's own, byte
-     * for byte what v5.4.1 produced.
-     *
-     * What this script adds (strictly observational, isolated):
-     *   • login short-circuit — anonymous users get an accurate
-     *     tooltip and the doomed request is never fired;
-     *   • a per-card busy guard so double clicks cannot fire two
-     *     opposite toggles;
-     *   • outcome observation — the overlay that appears IS the
-     *     server's answer (scaffold title "Message" = wh-core's
-     *     error dialog). Only after it proves the toggle was
-     *     accepted do the star state and count update, derived from
-     *     the server outcome (pre-click server state inverted,
-     *     count ±1 from its server-rendered value) — never forced;
-     *   • boot truth from wallhaven's server-rendered .faved marker
-     *     (wh-core css: .thumb>.thumb-info>.faved) — wallpapers
-     *     already in the account collections show the favorited
-     *     star immediately; stale local mirror entries self-heal;
-     *   • multi-instance sync + gf_favs persistence (pagehide flush).
-     * A v7.1.0-style custom request flow is kept below, used only
-     * if wh-core's overlay stack is missing (defensive fallback). */
-
-    /* Exact v5.4.1 account-collection entry point.  The native handler
-     * opens the logged-in user's picker from /favorites/fav/{id}; the
-     * picker then uses /favorites/quickFav with the collection id and
-     * server token.  Never use /wallpaper/fav/{id}, which is the public-
-     * collection flow observed in 7.1.1. */
-    const FAV_URL = id => 'https://wallhaven.cc/favorites/fav/' + encodeURIComponent(id);
-
-    /* Pristine #overlay scaffold, captured at boot before any overlay
-     * use. wh-core's error dialog reuses it (its title stays
-     * "Message"); its success path replaces the whole content with
-     * the server's view. */
-    const _favOv = document.getElementById('overlay');
-    const _favOvInner = _favOv && _favOv.querySelector('.overlay-inner');
-    /* Native pages render .faved on stars the account already holds.
-     * One sighting proves the marker is live on this page; ABSENCE of
-     * .faved on a native star is then authoritative too (stale mirror
-     * entries self-heal). With no sighting anywhere the mirror still
-     * decides (v7.0.8 behavior, kept as the safe fallback). */
-    let _favedSeen = !!document.querySelector('.wall-favs.faved');
-
-    const _favBusy = new WeakSet();
 
     function favParseCount (el) {
         if (!el) return 0;
@@ -722,121 +766,762 @@
         return isNaN(v) ? 0 : v;
     }
 
-    /* Apply the SERVER-confirmed favorite state to every rendered
-     * instance of the same wallpaper (grid card, scan card, …). */
-    function favApply (id, favOn, count) {
-        document.querySelectorAll('figure.thumb[data-wallpaper-id="' + id + '"] .nx-fav').forEach(btn => {
-            btn.classList.toggle('on', favOn);
-            btn.classList.toggle('faved', favOn);
-            btn.setAttribute('aria-pressed', String(favOn));
-            btn.title = favOn ? 'Remove from favorites' : 'Add to favorites';
-            const n = btn.querySelector('.nx-fav-n');
-            if (n && count != null) n.textContent = count.toLocaleString();
-        });
-        if (favOn) _favSet.add(id); else _favSet.delete(id);
-        favPersist();
+    /* Star tooltip — what a tap will ACTUALLY do. The remove wording
+     * deliberately does not name the Quick-Save collection: removal
+     * targets wherever the wallpaper really is. */
+    function favTitleFor (on) {
+        const q = quickLoad();
+        if (on) return 'Remove from favorites · hold to change';
+        return q ? 'Quick-save to “' + (q.name || 'collection') + '” · hold to change'
+                 : 'Save to a collection · hold for Quick-Save';
     }
 
-    /* Watch wh-core's #overlay for the outcome of the native toggle.
-     * wh-core signals failure by rebuilding its scaffold inside the
-     * overlay: the title becomes "Error" (bad reply — its f() calls
-     * d(msg, "Error")) or stays "Message" (network failure — f()
-     * with no title argument). Any other title — or none — is the
-     * server's own view, i.e. the toggle itself succeeded
-     * server-side. */
-    function favObserveOutcome (anchor, fig, wasOn) {
-        if (!_favOv || !_favOvInner) { setTimeout(() => _favBusy.delete(fig), 300); return; }
-        const t0 = Date.now();
-        const timer = setInterval(() => {
-            if (!_favOv.classList.contains('overlay-hidden')) {
-                clearInterval(timer);
-                const t = _favOvInner.querySelector('.overlay-title');
-                const titleTxt = t ? t.textContent.trim() : '';
-                /* "Error" = bad reply, "Message" = network failure */
-                const ok = titleTxt !== 'Error' && titleTxt !== 'Message';
-                if (anchor.isConnected) {
-                    anchor.removeAttribute('aria-busy');
-                    if (ok) {
-                        const id = fig.getAttribute('data-wallpaper-id');
-                        const count = Math.max(0, favParseCount(anchor) + (wasOn ? -1 : 1));
-                        favApply(id, !wasOn, count);
-                        anchor.dataset.favState = 'success';
-                        setTimeout(() => { if (anchor.isConnected) delete anchor.dataset.favState; }, 700);
-                    } else {
-                        delete anchor.dataset.favState;
-                        anchor.classList.add('nx-fav-err');
-                        anchor.title = 'Favorite failed — click to retry';
-                        setTimeout(() => { if (anchor.isConnected) anchor.classList.remove('nx-fav-err'); }, 1600);
-                    }
+    /* ────────────────────────────────────────────────────────────
+     * FAVSTATE — the single source of favorite truth.
+     *
+     *   loc:      wallpaperId → { cols:Set<cid>, ts }   — where it lives
+     *   seeds:    server-rendered .faved hints (fast, in-memory; the
+     *             server marker is never downgraded by our own scans)
+     *   catalog:  { list:[{id,name,count}], token, ts }  — account shape
+     *   counts:   cid → wallpapers observed on the last full walk of
+     *             that collection (the cache-validation key)
+     *   loaded:   a complete, count-consistent walk finished (this
+     *             session or restored from cache)
+     *
+     * isOn(id) = the server said .faved  OR  a known collection holds it.
+     * A completed removal clears both, so the answer can not stick at
+     * "on". Nothing is ever written before the server confirms, so a
+     * failed request can not corrupt state either.
+     * ──────────────────────────────────────────────────────────── */
+    const FAV_INDEX_KEY  = 'gf_fav_index_v30';
+    const FAV_INDEX_CAP  = 20000;
+    const FavState = (() => {
+        let loaded = false, loadP = null;
+        const seeds = new Set();
+        const loc   = new Map();
+        const counts = new Map();                 // cid → observed count
+        let persistT = 0;
+
+        function readIndex () {
+            try {
+                const v = JSON.parse(GM_getValue(FAV_INDEX_KEY, 'null'));
+                if (!v || v.v !== 3 || typeof v.loc !== 'object' || !v.loc) return;
+                for (const [id, cols] of Object.entries(v.loc)) {
+                    if (/^[a-z0-9]{6}$/i.test(id) && Array.isArray(cols))
+                        loc.set(id, { cols: new Set(cols.map(String)), ts: v.ts || 0 });
                 }
-                setTimeout(() => _favBusy.delete(fig), 300);
-            } else if (Date.now() - t0 > 10000) {
-                clearInterval(timer);
-                if (anchor.isConnected) {
-                    anchor.removeAttribute('aria-busy');
-                    delete anchor.dataset.favState;
-                    anchor.classList.add('nx-fav-err');
-                    anchor.title = 'Favorite failed — click to retry';
-                    setTimeout(() => { if (anchor.isConnected) anchor.classList.remove('nx-fav-err'); }, 1600);
-                }
-                setTimeout(() => _favBusy.delete(fig), 300);
+                if (v.counts && typeof v.counts === 'object')
+                    for (const [cid, n] of Object.entries(v.counts))
+                        if (Number.isFinite(n)) counts.set(String(cid), n);
+                loaded = !!v.complete;
+            } catch {}
+        }
+        function flush () {
+            clearTimeout(persistT);
+            if (loc.size > FAV_INDEX_CAP) {
+                [...loc.keys()].slice(0, loc.size - FAV_INDEX_CAP).forEach(k => loc.delete(k));
             }
-        }, 120);
+            try {
+                GM_setValue(FAV_INDEX_KEY, JSON.stringify({
+                    v: 3, ts: Date.now(), complete: loaded,
+                    loc: Object.fromEntries([...loc].map(([id, r]) => [id, [...r.cols]])),
+                    counts: Object.fromEntries([...counts]),
+                }));
+            } catch {}
+        }
+        const persistSoon = () => { clearTimeout(persistT); persistT = setTimeout(flush, 1200); };
+        readIndex();
+
+        /* server .faved hint — the freshest possible signal from the
+         * page itself; wins over an older walk, never downgraded */
+        const markSeed = (id, on) => { id = String(id); if (on) seeds.add(id); else seeds.delete(id); };
+        const isOn = id => { id = String(id); if (seeds.has(id)) return true; const r = loc.get(id); return !!(r && r.cols.size > 0); };
+        /* locations for display (picker chips): known record, else
+         * null when we simply do not know yet */
+        function locsDisplay (id) {
+            id = String(id);
+            const r = loc.get(id);
+            return r ? [...r.cols] : (loaded ? [] : null);
+        }
+        /* locations trusted for REMOVAL: only once a complete walk
+         * has finished (records alone may be partial) */
+        function locsFull (id) {
+            id = String(id);
+            if (!loaded) return null;
+            const r = loc.get(id);
+            return r ? [...r.cols] : [];
+        }
+        function setCols (id, cols) {          // authoritative post-op truth
+            id = String(id);
+            const clean = (cols || []).map(String).filter(Boolean);
+            if (!clean.length) { loc.delete(id); seeds.delete(id); }
+            else loc.set(id, { cols: new Set(clean), ts: Date.now() });
+            persistSoon();
+        }
+        function addCol (id, cid) {            // presence seen/confirmed (walks, ops)
+            id = String(id); cid = String(cid);
+            const r = loc.get(id) || { cols: new Set(), ts: 0 };
+            r.cols.add(cid); r.ts = Date.now();
+            loc.set(id, r);                    // never touches seeds — a later
+            persistSoon();                     // diff may drop this again
+        }
+        const noteWalk = (cid, n) => { counts.set(String(cid), n); persistSoon(); };
+        const walkCount = cid => counts.get(String(cid));
+        const hasCache  = () => loaded || loc.size > 0;
+
+        /* Full index build / validation: fresh catalog → walk every
+         * collection whose observed count no longer matches. The
+         * walk records every membership it sees and drops cid from
+         * records it no longer sees (presence is only ever learned
+         * from a page that rendered the wallpaper). */
+        async function ensureIndex () {
+            if (loadP) return loadP;
+            loadP = (async () => {
+                const cat = await favGetCatalog();     // TTL cache is fine for validation
+                for (const c of cat.list) {
+                    const cid = String(c.id);
+                    if (c.count != null && walkCount(cid) === c.count) continue;   // unchanged
+                    const seen = new Set();
+                    await favWalkCollection(cid, { count: c.count, onPage: figs => figs.forEach(f => seen.add(f.getAttribute('data-wallpaper-id'))) });
+                    for (const [wid, rec] of [...loc]) {
+                        if (rec.cols.has(cid) && !seen.has(wid)) {
+                            rec.cols.delete(cid);
+                            if (!rec.cols.size) loc.delete(wid); else loc.set(wid, rec);
+                        }
+                    }
+                    seen.forEach(wid => addCol(wid, cid));
+                    noteWalk(cid, seen.size);
+                }
+                loaded = true;
+                flush();
+                favRenderAll();
+            })().catch(e => { console.warn('[naXim Labs] favorite index refresh failed', e); })
+                 .finally(() => { loadP = null; });
+            return loadP;
+        }
+        let ensureT = 0;
+        function ensureIndexSoon (ms) {
+            clearTimeout(ensureT);
+            ensureT = setTimeout(() => { ensureIndex(); }, ms == null ? 2500 : ms);
+        }
+
+        return { markSeed, isOn, locsDisplay, locsFull, setCols, addCol,
+                 noteWalk, walkCount, hasCache, ensureIndex, ensureIndexSoon, flush };
+    })();
+    favFlush = () => FavState.flush();     // wired into the pagehide flush
+
+    /* ─── network helpers ─────────────────────────────────────── */
+
+    async function favHtml (url) {
+        const r = await fetch(url, { credentials: 'same-origin',
+            headers: { Accept: 'text/html,application/xhtml+xml' },
+            signal: (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) ? AbortSignal.timeout(20000) : undefined });
+        if (!r.ok) throw new Error('Wallhaven could not load the account collection page');
+        return r.text();
+    }
+    async function favRequestMethod (url, method) {
+        const r = await fetch(url, { method, credentials: 'same-origin',
+            headers: { 'X-Requested-With': 'XMLHttpRequest', Accept: 'application/json, text/javascript, */*; q=0.01' },
+            signal: (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) ? AbortSignal.timeout(20000) : undefined });
+        const text = await r.text(); let data = null;
+        try { data = JSON.parse(text); } catch {}
+        if (!r.ok || (data && data.status === false)) {
+            const err = new Error((data && (data.msg || data.message)) || 'Wallhaven rejected the request');
+            err.status = r.status;
+            throw err;
+        }
+        return data || { status: true };
     }
 
-    /* Direct (target-phase) click listener — runs before wh-core's
-     * body-delegated .overlay-anchor handler. For logged-in users it
-     * adds cosmetics + the busy guard and lets the native flow
-     * continue untouched; for anonymous users it blocks the flow (a
-     * guaranteed-failing request would otherwise run) and shows an
-     * accurate tooltip instead. */
-    function favOnAnchorClick (e) {
-        const a = e.currentTarget;
-        const fig = a.closest('figure.thumb');
-        if (favLoggedOut()) {
-            e.preventDefault();
-            e.stopImmediatePropagation();
-            a.classList.remove('nx-pulse'); void a.offsetWidth; a.classList.add('nx-pulse');
-            a.classList.add('nx-fav-err');
-            a.title = 'Log in to Wallhaven to favorite';
-            setTimeout(() => { if (a.isConnected) a.classList.remove('nx-fav-err'); }, 1600);
-            return;
-        }
-        if (!_favOv || !_favOvInner || !window.jQuery) {
-            /* wh-core overlay stack unavailable — defensive fallback. */
-            e.preventDefault();
-            e.stopImmediatePropagation();
-            if (fig) favToggleFallback(fig, a);
-            return;
-        }
-        if (fig && _favBusy.has(fig)) { e.preventDefault(); e.stopImmediatePropagation(); return; }
-        const wasOn = a.classList.contains('on') || a.classList.contains('faved');
-        if (fig) _favBusy.add(fig);
-        a.classList.remove('nx-pulse'); void a.offsetWidth; a.classList.add('nx-pulse');
-        a.dataset.favState = 'loading';
-        a.setAttribute('aria-busy', 'true');
-        a.title = wasOn ? 'Removing from favorites…' : 'Adding to favorites…';
-        favObserveOutcome(a, fig, wasOn);
+    /* Account catalog: the /favorites page carries the CSRF token,
+     * the collection list and each collection's count. Cached for a
+     * short TTL so rapid multi-tap saves do not re-scrape it, and
+     * fetched at most once concurrently no matter how many callers
+     * race on it. */
+    const FAV_CAT_TTL = 45000;
+    let _catCache = null, _catP = null;
+    function favParseCatalog (html) {
+        const d = document.implementation.createHTMLDocument('catalog'); d.body.innerHTML = html;
+        const tokenLink = d.querySelector('a[href*="_token="]');
+        const token = tokenLink && new URL(tokenLink.getAttribute('href'), location.origin).searchParams.get('_token');
+        const seen = new Set(), list = [];
+        [...d.querySelectorAll('a[href]')].forEach(a => {
+            const m = new URL(a.getAttribute('href'), location.origin).pathname.match(/^\/favorites\/(\d+)$/);
+            if (!m) return;
+            const cid = m[1];
+            const name = a.textContent.replace(/^\s*\d+\s*/, '').replace(/\s+/g, ' ').trim();
+            if (!name || seen.has(cid)) return;
+            seen.add(cid);
+            list.push({ id: cid, name });
+        });
+        /* wh-core's own drag-and-drop reads #collection-{id} small —
+         * the same nodes carry each collection's count */
+        list.forEach(c => {
+            const box = d.querySelector('#collection-' + c.id);
+            const sm = box && box.querySelector('small');
+            if (sm) { const n = parseInt((sm.textContent || '').replace(/[^\d]/g, ''), 10); if (!isNaN(n)) c.count = n; }
+        });
+        if (!token || !list.length) throw new Error('No account collections were returned');
+        return { list, token, ts: Date.now() };
+    }
+    function favGetCatalog (fresh) {
+        if (!fresh && _catCache && Date.now() - _catCache.ts < FAV_CAT_TTL) return Promise.resolve(_catCache);
+        if (_catP) return _catP;
+        _catP = (async () => {
+            const cat = favParseCatalog(await favHtml('https://wallhaven.cc/favorites'));
+            _catCache = cat;
+            return cat;
+        })().finally(() => { _catP = null; });
+        return _catP;
     }
 
-    /* v5.4.1 leaves the native anchor untouched so Wallhaven's own
-     * delegated handler owns the account/collection workflow. */
-    function bindFavAnchor () {}
+    /* Walks one collection's pages (/favorites/{cid}?page=n).
+     * The page size is learned from the first page; the walk stops on
+     * an empty page, a short page, or when the server's own count has
+     * been reached — so it is correct for any listing size wallhaven
+     * chooses, and collections with a known count cost one request
+     * instead of a probe for an empty last page. Two duties at once:
+     *   • wid given → find-mode: stops paging once wid is located
+     *     and returns its quickDelete link (the find check runs
+     *     before the stop checks, so a wid on the final page is
+     *     always seen)
+     *   • onPage → records every figure seen (index building)
+     * Returns { pages, found, delLink, complete, count } —
+     * complete=true when the walk reached the listing's end. */
+    const FAV_WALK_POOL = makePool(2);
+    async function favWalkCollection (cid, opts = {}) {
+        const res = { pages: 0, found: false, delLink: null, complete: false, count: 0 };
+        let pageSize = 0;
+        for (let page = 1; page <= 400; page++) {
+            const html = await FAV_WALK_POOL(() => favHtml('https://wallhaven.cc/favorites/' + encodeURIComponent(cid) + (page > 1 ? '?page=' + page : '')));
+            const d = document.implementation.createHTMLDocument('walk'); d.body.innerHTML = html;
+            const figs = [...d.querySelectorAll('figure.thumb[data-wallpaper-id]')];
+            res.pages++; res.count += figs.length;
+            if (page === 1) pageSize = Math.max(1, figs.length);
+            if (opts.onPage) opts.onPage(figs, page);
+            if (opts.wid != null) {
+                const f = figs.find(x => x.getAttribute('data-wallpaper-id') === String(opts.wid));
+                if (f) {
+                    res.found = true;
+                    const a = f.querySelector('a.thumb-btn-unfav[href*="/favorites/quickDelete"]');
+                    if (a) res.delLink = new URL(a.getAttribute('href'), location.origin).href;
+                    return res;                       // located — stop paging this collection
+                }
+            }
+            if (!figs.length) { res.complete = true; return res; }                        // listing exhausted
+            if (opts.count != null && res.count >= opts.count) { res.complete = true; return res; }   // server count reached
+            if (figs.length < pageSize) { res.complete = true; return res; }              // short page
+        }
+        return res;
+    }
 
-    /* Fallback collection-picker display (v7.1.0 flow, only used by
-     * favToggleFallback when wh-core's overlay stack is absent).
-     * A successful favorite toggle reply carries { view } — the HTML
-     * of wallhaven's own collections overlay. wh-core shows it with
-     * exactly two moves: T.html(view) (T = '#overlay .overlay-inner')
-     * followed by removing 'overlay-hidden' from #overlay. This
-     * replicates that sequence 1:1. If wh-core's container is ever
-     * missing or renamed, the modal is skipped silently — the
-     * favorite toggle itself already succeeded and must never break. */
+    /* ─── rendering — the only DOM writers for star state ──────── */
+
+    function favRender (id, opts = {}) {
+        id = String(id);
+        const on = FavState.isOn(id);
+        const busy = _favOps.has(id);
+        document.querySelectorAll('figure.thumb[data-wallpaper-id="' + id + '"] .nx-fav').forEach(btn => {
+            btn.classList.toggle('on', on);
+            btn.classList.toggle('faved', on);
+            btn.setAttribute('aria-pressed', String(on));
+            btn.dataset.nxAccountState = on ? 'on' : 'off';
+            if (busy) { btn.setAttribute('aria-busy', 'true'); btn.dataset.favState = 'loading'; }
+            else { btn.removeAttribute('aria-busy'); if (!opts.keepFlash) delete btn.dataset.favState; }
+            btn.title = busy ? (on ? 'Removing from favorites…' : 'Saving to favorites…') : favTitleFor(on);
+        });
+    }
+    function favRenderAll () {
+        document.querySelectorAll('figure.thumb[data-wallpaper-id]').forEach(f => favRender(f.getAttribute('data-wallpaper-id')));
+    }
+    /* transient success/error feedback on top of the real state */
+    function favFlash (id, kind, msg) {
+        id = String(id);
+        document.querySelectorAll('figure.thumb[data-wallpaper-id="' + id + '"] .nx-fav').forEach(btn => {
+            btn.dataset.favState = kind;
+            if (kind === 'error') btn.classList.add('nx-fav-err');
+            clearTimeout(btn._favFlashT);
+            btn._favFlashT = setTimeout(() => {
+                if (btn.isConnected) { delete btn.dataset.favState; btn.classList.remove('nx-fav-err'); btn.title = favTitleFor(FavState.isOn(id)); }
+            }, kind === 'error' ? 1700 : 750);
+        });
+        if (msg) favNotice(msg, kind === 'error' ? 'error' : 'ok');
+    }
+
+    /* ─── per-wallpaper operation lock ──────────────────────────
+     * Every mutation for one wallpaper runs exclusively: the op in
+     * flight owns the truth; taps that arrive meanwhile coalesce
+     * into ONE pending toggle that re-reads the state when its turn
+     * comes. Overlapping responses can not overwrite each other,
+     * and a burst of taps resolves to at most two server ops. */
+    const _favOps  = new Map();     // wid → in-flight promise
+    const _favPend = new Set();     // wid → one coalesced follow-up toggle
+    function favRun (id, fn) {
+        id = String(id);
+        const prev = _favOps.get(id) || Promise.resolve();
+        let p;
+        p = prev.then(async () => {
+            favRender(id);                                   // busy state on (entry already set)
+            try { await fn(); }
+            catch (e) { console.error('[naXim Labs] favorite operation failed', e); }
+            finally {
+                if (_favOps.get(id) === p) _favOps.delete(id);   // never delete a newer op's entry
+                favRender(id);                                   // busy state off
+                if (_favPend.delete(id)) favToggle(id);          // one coalesced follow-up
+            }
+        });
+        _favOps.set(id, p);
+        return p;
+    }
+
+    /* ─── operations ──────────────────────────────────────────── */
+
+    /* Resolve the wallpaper's ACTUAL collections by walking every
+     * collection until it is located — and record every membership
+     * the pages reveal, so the expensive case doubles as an index
+     * build. Collections are checked in parallel (the walk pool
+     * still caps total concurrency). */
+    async function favResolveExhaustive (id) {
+        const cat = await favGetCatalog(true);          // fresh — this is the correctness path
+        const found = [];
+        await Promise.all(cat.list.map(async c => {
+            let complete = false, count = 0;
+            const r = await favWalkCollection(c.id, {
+                wid: id,
+                count: c.count,
+                onPage: figs => { count += figs.length; figs.forEach(f => FavState.addCol(f.getAttribute('data-wallpaper-id'), c.id)); },
+            });
+            if (r.complete) { complete = true; count = r.count; }
+            if (complete) FavState.noteWalk(c.id, count);
+            if (r.found) found.push({ cid: String(c.id), link: r.delLink });
+        }));
+        return found;
+    }
+
+    /* ADD — to a real collection, chosen by the Quick-Save target or
+     * the picker row. The token is fresh; a rotated CSRF (419) is
+     * retried exactly once with a brand-new catalog. */
+    async function favAdd (id, cid, opts = {}) {
+        const cat = await favGetCatalog();
+        const col = cat.list.find(c => String(c.id) === String(cid));
+        if (!col) {
+            if (opts.quick) { quickSave(null); refreshQuickStates(); favRenderAll(); }
+            throw new Error('That collection no longer exists — hold the star to pick another.');
+        }
+        const build = c => 'https://wallhaven.cc/favorites/add?wallHashid=' + encodeURIComponent(id) +
+                           '&collectionId=' + encodeURIComponent(c.id) + '&_token=' + encodeURIComponent(cat.token);
+        try { await favRequestMethod(build(col), 'POST'); }
+        catch (e) {
+            if (e && e.status === 419) {                       // token rotated mid-session
+                const cat2 = await favGetCatalog(true);
+                const col2 = cat2.list.find(c => String(c.id) === String(cid));
+                if (!col2) throw new Error('That collection no longer exists — hold the star to pick another.');
+                await favRequestMethod('https://wallhaven.cc/favorites/add?wallHashid=' + encodeURIComponent(id) +
+                    '&collectionId=' + encodeURIComponent(col2.id) + '&_token=' + encodeURIComponent(cat2.token), 'POST');
+            } else throw e;
+        }
+        FavState.addCol(id, col.id);
+        favFlash(id, 'success', 'Saved to ' + col.name);
+    }
+
+    /* REMOVE — from wherever the wallpaper ACTUALLY is. The
+     * Quick-Save target is never consulted. */
+    async function favRemove (id) {
+        const known = FavState.locsFull(id);                  // null = not trustworthy yet
+        let entries;
+        if (known == null) {
+            entries = await favResolveExhaustive(id);          // walk every collection, record truth
+        } else {
+            entries = [];
+            for (const cid of known) {
+                /* no count hint here: a cached count may predate this
+                 * session, and a stale-low count could stop the walk
+                 * one page short of the wallpaper — correctness first */
+                const r = await favWalkCollection(cid, { wid: id });
+                if (r.found) entries.push({ cid: String(cid), link: r.delLink });
+                /* not found → stale record entry; the wholesale
+                 * setCols below drops it */
+            }
+        }
+        const withLink = entries.filter(e => e.link);
+        const noLink   = entries.filter(e => !e.link);
+        let removed = 0;
+        for (const e of withLink) {
+            try { await favRequestMethod(e.link, 'GET'); removed++; }
+            catch (err) { if (!err || err.status !== 404) throw err; removed++; }   // 404 = already gone
+        }
+        /* everything with a link is now gone; anything without a
+         * link stays recorded (it could not be removed) */
+        FavState.setCols(id, noLink.map(e => e.cid));
+        if (noLink.length) {
+            favFlash(id, 'error', 'Removed from ' + removed + ' collection' + (removed === 1 ? '' : 's') +
+                      ', but ' + noLink.length + ' could not be reached — try again in a moment.');
+            return;
+        }
+        favFlash(id, 'success',
+            removed === 0 ? 'It was not in your collections — the star is refreshed now.'
+          : removed === 1 ? 'Removed from favorites'
+          : 'Removed from ' + removed + ' collections');
+    }
+
+    /* The star tap: ONE decision, read from live state at execution
+     * time — add via the configured flow, or remove immediately.
+     * Already-favorited never opens the picker. A tap while an op is
+     * in flight coalesces into a single follow-up toggle instead of
+     * queueing unbounded work. */
+    async function favDecide (id) {
+        if (FavState.isOn(id)) {
+            try { await favRemove(id); }
+            catch (e) { favFlash(id, 'error', (e && e.message) || 'Removal failed'); }
+        } else {
+            const q = quickLoad();
+            if (q) {
+                try { await favAdd(id, q.id, { quick: true }); }
+                catch (e) { favFlash(id, 'error', (e && e.message) || 'Save failed'); }
+            } else await openFavManager(id);                    // manual flow — the picker belongs to adding
+        }
+    }
+    function favToggle (id) {
+        id = String(id);
+        if (favLoggedOut()) { favNotice('Log in to Wallhaven to save favorites', 'error'); return Promise.resolve(); }
+        if (_favOps.has(id)) { _favPend.add(id); return _favOps.get(id); }
+        return favRun(id, () => favDecide(id));
+    }
+
+    /* ─── Quick-Save target — one stored value, the only source ── */
+    const QUICK_FAV_KEY    = 'gf_quick_fav_collection_v713';
+    const QUICK_NOTICE_KEY = 'gf_quick_fav_notice_v713';
+    const quickLoad = () => { try { const v = GM_getValue(QUICK_FAV_KEY, null); return v && v.id ? v : null; } catch { return null; } };
+    const quickSave = v => { try { v ? GM_setValue(QUICK_FAV_KEY, v) : GM_deleteValue(QUICK_FAV_KEY); } catch {} };
+
+    /* Other tabs: keep their stars and pickers in agreement with a
+     * target changed elsewhere (Tampermonkey broadcasts changes). */
+    if (typeof GM_addValueChangeListener === 'function') {
+        try { GM_addValueChangeListener(QUICK_FAV_KEY, () => { refreshQuickStates(); favRenderAll(); }); } catch {}
+    }
+
+    function favNotice (msg, kind) {
+        let el = document.getElementById('nx-fav-notice');
+        if (!el) { el = document.createElement('div'); el.id = 'nx-fav-notice'; document.body.appendChild(el); }
+        el.textContent = msg; el.dataset.kind = kind || 'info'; el.classList.add('show');
+        clearTimeout(el._timer); el._timer = setTimeout(() => el.classList.remove('show'), 3800);
+    }
+    function favHideOverlay () {
+        const ov = document.getElementById('overlay');
+        if (!ov) return;
+        ov.classList.add('overlay-hidden');
+        const inner = ov.querySelector('.overlay-inner');
+        if (inner) setTimeout(() => { if (ov.classList.contains('overlay-hidden')) inner.innerHTML = ''; }, 500);
+    }
+
+    /* ─── Collection picker — the ADD flow's destination chooser ──
+     *
+     * Structure mirrors wh-core's own views exactly, so the frame,
+     * the backdrop-click close and the delegated .overlay-close
+     * handler remain wallhaven's own:
+     *   .overlay-inner > .overlay-header  (title + close)
+     *                   > .overlay-content (51px top padding clears
+     *                                      the title bar; scrolls)
+     * One dialog, orthogonal actions per collection:
+     *   • tap the row → save THIS wallpaper to that collection
+     *   • tap the ⚡  → make that collection the one-tap Quick-Save
+     *                  target (exactly one active; tapping the active
+     *                  one turns Quick-Save off)
+     * Rows holding the wallpaper already show a "Saved" chip,
+     * re-derived from FavState on every render. */
+    let _pickerSeq = 0;   // invalidates renders from superseded opens
+
+    function pickerIsActive (id) {
+        const ov = document.getElementById('overlay');
+        if (!ov || ov.classList.contains('overlay-hidden')) return false;
+        const box = ov.querySelector('.overlay-inner .nx-picker');
+        return !!(box && box.dataset.wallId === id);
+    }
+
+    function renderPicker (id) {
+        const ov = document.getElementById('overlay'), inner = ov && ov.querySelector('.overlay-inner');
+        if (!ov || !inner) throw new Error('Wallhaven overlay is unavailable');
+        bindFavOverlayEscape();
+        inner.innerHTML = '';
+        const header = document.createElement('header'); header.className = 'overlay-header';
+        const title = document.createElement('h2'); title.className = 'overlay-title'; title.textContent = 'Save to collection';
+        const close = document.createElement('a');
+        close.className = 'jsAnchor overlay-close'; close.id = 'overlay-close';
+        close.title = 'Close (Esc)';
+        close.setAttribute('role', 'button');
+        close.setAttribute('tabindex', '0');
+        close.setAttribute('aria-label', 'Close');
+        close.innerHTML = IC.x;
+        close.addEventListener('click', ev => { ev.preventDefault(); favHideOverlay(); });
+        close.addEventListener('keydown', ev => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); close.click(); } });
+        header.append(title, close);
+        const content = document.createElement('div'); content.className = 'overlay-content';
+        const box = document.createElement('div'); box.className = 'nx-picker'; box.dataset.wallId = id;
+        content.appendChild(box);
+        inner.append(header, content);
+        ov.classList.remove('overlay-hidden');
+        close.focus({ preventScroll: true });
+        return box;
+    }
+
+    /* Context header — which wallpaper the picker is about. */
+    function pickerHead (box, id) {
+        const top = mk('div', 'nx-picker-top');
+        const img = mk('img', 'nx-picker-thumb');
+        img.src = deriveThumb(id); img.alt = ''; img.loading = 'lazy';
+        img.addEventListener('error', () => { img.remove(); });
+        const tt = mk('div', 'nx-picker-tt');
+        const h = mk('strong');
+        h.textContent = 'Save this wallpaper';
+        const hash = mk('i'); hash.textContent = '#' + id;
+        h.appendChild(hash);
+        const s = mk('span');
+        s.textContent = 'Tap a row to save it there · ⚡ sets your Quick-Save target.';
+        tt.append(h, s);
+        top.append(img, tt);
+        box.appendChild(top);
+    }
+
+    function pickerLoading (box, id) {
+        box.textContent = '';
+        pickerHead(box, id);
+        const l = mk('div', 'nx-picker-loading');
+        const sp = mk('span', 'nx-spin'); sp.setAttribute('aria-hidden', 'true');
+        const t = mk('span'); t.textContent = 'Loading your collections…';
+        l.append(sp, t);
+        box.appendChild(l);
+    }
+
+    function pickerError (box, err, retry) {
+        box.textContent = '';
+        pickerHead(box, box.dataset.wallId);
+        const e = mk('div', 'nx-picker-error');
+        const p = mk('p'); p.textContent = (err && err.message) || 'Could not load your collections.';
+        const b = mk('button', 'nx-picker-retry'); b.type = 'button'; b.textContent = 'Try again';
+        b.addEventListener('click', retry);
+        e.append(p, b);
+        box.appendChild(e);
+    }
+
+    function pickerFill (box, id, cols) {
+        if (!box.isConnected) return;
+        box.textContent = '';
+        pickerHead(box, id);
+        const list = mk('div', 'nx-picker-list');
+        cols.forEach(c => {
+            const row = mk('div', 'nx-picker-row');
+            row.setAttribute('role', 'button');
+            row.tabIndex = 0;
+            row.dataset.cid = String(c.id);
+            row.title = 'Save to “' + c.name + '”';
+            const name = mk('span', 'nx-picker-name'); name.textContent = c.name;
+            const saved = mk('span', 'nx-picker-saved'); saved.textContent = 'Saved';
+            const qs = mk('button', 'nx-picker-qs'); qs.type = 'button';
+            qs.innerHTML = IC.bolt;
+            const lbl = mk('span'); lbl.textContent = 'Quick-Save';
+            qs.appendChild(lbl);
+            row.append(name, saved, qs);
+            row.addEventListener('click', () => saveToCollection(id, c, row));
+            row.addEventListener('keydown', ev => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); row.click(); } });
+            qs.addEventListener('click', ev => { ev.stopPropagation(); toggleQuickTarget(c); });
+            list.appendChild(row);
+        });
+        box.appendChild(list);
+        const foot = mk('div', 'nx-picker-foot');
+        const status = mk('span', 'nx-picker-status');
+        foot.appendChild(status);
+        box.appendChild(foot);
+        refreshQuickStates();
+    }
+
+    /* Single render pass over the open picker — re-derives every
+     * active/current state and the status line from quickLoad() and
+     * FavState, so there is no way for the UI and the stored truth
+     * to diverge. */
+    function refreshQuickStates () {
+        const box = document.querySelector('.overlay-inner .nx-picker');
+        if (!box) return;
+        const q = quickLoad();
+        const cur = FavState.locsDisplay(box.dataset.wallId);
+        box.querySelectorAll('.nx-picker-row').forEach(row => {
+            const cid = String(row.dataset.cid);
+            const active = !!q && cid === String(q.id);
+            const holds = !!(cur && cur.includes(cid));
+            const name = row.querySelector('.nx-picker-name');
+            const label = 'Save to ' + ((name && name.textContent) || 'collection');
+            row.classList.toggle('active', active);
+            row.classList.toggle('current', holds);
+            row.setAttribute('aria-label', (holds ? 'Currently saved here — ' : '') + label + (active ? ' — Quick-Save target' : ''));
+            const qs = row.querySelector('.nx-picker-qs');
+            if (qs) {
+                qs.setAttribute('aria-pressed', String(active));
+                qs.title = active ? 'Quick-Save target — click to turn off' : 'Make this the Quick-Save target';
+            }
+            const saved = row.querySelector('.nx-picker-saved');
+            if (saved) saved.style.display = holds ? '' : 'none';
+        });
+        const status = box.querySelector('.nx-picker-status');
+        if (status) {
+            status.textContent = '';
+            if (q) {
+                status.append('Quick-Save is ON — one tap on the ★ saves to ');
+                const b = mk('b'); b.textContent = q.name || 'collection';
+                status.append(b, '. Tapping a favorited ★ always removes it.');
+            } else {
+                status.textContent = 'Tap ⚡ on a collection to make it your one-tap Quick-Save target for the ★.';
+            }
+        }
+    }
+
+    /* The only writer of the Quick-Save target besides favAdd's
+     * self-healing invalidation — one call, one stored value. */
+    function toggleQuickTarget (c) {
+        const cur = quickLoad();
+        if (cur && String(cur.id) === String(c.id)) {
+            quickSave(null);
+            favNotice('Quick-Save off — tapping the ★ now opens this picker', 'ok');
+        } else {
+            quickSave({ id: String(c.id), name: c.name, href: c.href || '' });
+            const first = !GM_getValue(QUICK_NOTICE_KEY, false);
+            GM_setValue(QUICK_NOTICE_KEY, true);
+            favNotice(first ? 'Quick-Save target: ' + c.name + ' — one tap on the ★ saves there. Hold the ★ to change.'
+                            : 'Quick-Save target: ' + c.name, 'ok');
+        }
+        refreshQuickStates();
+        favRenderAll();     // star tooltips name the new target
+    }
+
+    function saveToCollection (id, c, row) {
+        if (row.classList.contains('busy')) return;
+        const qs = row.querySelector('.nx-picker-qs');
+        const spin = mk('span', 'nx-spin');
+        row.classList.add('busy');
+        if (qs) qs.appendChild(spin);
+        favRun(id, async () => {
+            try {
+                await favAdd(id, c.id);
+                favHideOverlay();
+            } catch (e) {
+                row.classList.remove('busy');
+                spin.remove();
+                favNotice((e && e.message) || 'Save failed', 'error');
+            }
+        });
+    }
+
+    async function pickerLoad (box, id) {
+        const seq = ++_pickerSeq;
+        pickerLoading(box, id);
+        try {
+            const cat = await favGetCatalog(true);            // the list must be live
+            if (seq === _pickerSeq && box.isConnected) pickerFill(box, id, cat.list);
+            FavState.ensureIndexSoon();                       // piggyback validation on the fresh catalog
+        } catch (e) {
+            if (seq === _pickerSeq && box.isConnected) pickerError(box, e, () => pickerLoad(box, id));
+        }
+    }
+
+    /* Opens the picker NOW (instant shell + loading state) — called
+     * from the hold timer the moment the threshold is reached, and
+     * from a plain star tap when the wallpaper is NOT favorited and
+     * no Quick-Save target is set. */
+    async function openFavManager (id) {
+        if (favLoggedOut()) { favNotice('Log in to Wallhaven to save favorites', 'error'); return; }
+        if (pickerIsActive(id)) return;   // already showing this wallpaper
+        let box;
+        try { box = renderPicker(id); }
+        catch (e) { favNotice((e && e.message) || 'Could not open the collection picker', 'error'); return; }
+        pickerLoad(box, id);
+    }
+
+    /* ─── Star interaction: tap vs deliberate hold ────────────────
+     *
+     * One pointer state machine per star, bound exactly once per
+     * element (WeakSet guard — cloneNode restores in clearGrid and
+     * re-runs of the upgrader can never double-bind).
+     *
+     *   press ── 400 ms ──▶ picker opens AT the threshold, while the
+     *                      star is still held (loading state first)
+     *   release < 400 ms ─▶ normal tap action
+     *   release after ───▶ swallow the ghost click (time-boxed
+     *                      window — no stale DOM flag left behind to
+     *                      eat a later, unrelated click)
+     *
+     * Movement: 9 px of slop is forgiven; beyond that (or on
+     * pointercancel, i.e. a scroll/drag gesture taking over) the
+     * hold cancels. Only the primary mouse button holds. On touch,
+     * the long-press context menu is suppressed while the hold is
+     * alive. */
+    const FAV_HOLD_MS = 400;        // deliberate-hold threshold (keep in sync with .nx-holding CSS)
+    const FAV_HOLD_SLOP = 9;         // px of tolerated movement
+    const FAV_SWALLOW_MS = 600;      // post-hold ghost-click window
+    const _favAnchorsBound = new WeakSet();
+
+    function bindFavAnchor (a) {
+        if (!a || _favAnchorsBound.has(a)) return;
+        _favAnchorsBound.add(a);
+
+        const st = { timer: 0, x: 0, y: 0, firedAt: 0 };
+
+        const clearHold = () => {
+            if (st.timer) { clearTimeout(st.timer); st.timer = 0; a.classList.remove('nx-holding'); }
+        };
+
+        const fireHold = () => {
+            st.timer = 0;
+            st.firedAt = Date.now();
+            a.classList.remove('nx-holding');
+            const f = a.closest('figure.thumb');
+            const id = f && f.getAttribute('data-wallpaper-id');
+            if (id) openFavManager(id);
+        };
+
+        a.addEventListener('pointerdown', (e) => {
+            st.firedAt = 0;                                         // new interaction resets suppression
+            if (e.pointerType === 'mouse' && e.button !== 0) return; // primary mouse button only
+            clearHold();
+            st.x = e.clientX; st.y = e.clientY;
+            a.classList.add('nx-holding');
+            st.timer = setTimeout(fireHold, FAV_HOLD_MS);
+        }, { passive: true });
+
+        a.addEventListener('pointermove', (e) => {
+            if (!st.timer) return;
+            const dx = e.clientX - st.x, dy = e.clientY - st.y;
+            if (dx * dx + dy * dy > FAV_HOLD_SLOP * FAV_HOLD_SLOP) clearHold();   // drag/scroll, not a hold
+        }, { passive: true });
+
+        ['pointerup', 'pointercancel', 'pointerleave'].forEach(t =>
+            a.addEventListener(t, clearHold, { passive: true }));
+
+        a.addEventListener('contextmenu', (e) => {
+            if (st.timer || Date.now() - st.firedAt < FAV_SWALLOW_MS) e.preventDefault();   // keep touch long-press clean
+        });
+
+        a.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            if (st.timer) clearHold();                             // released before the threshold
+            if (Date.now() - st.firedAt < FAV_SWALLOW_MS) return;  // release after the hold opened the picker
+            const f = a.closest('figure.thumb');
+            const id = f && f.getAttribute('data-wallpaper-id');
+            if (!id) return;
+            favToggle(id);   // add-or-remove, decided from live state under the per-wallpaper lock
+        }, true);
+        a.addEventListener('keydown', (e) => {                    // Space activates the star like a button
+            if (e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); a.click(); }
+        });
+    }
+
+    function bindAllFavAnchors () { document.querySelectorAll('figure.thumb .nx-fav, figure.thumb .wall-favs').forEach(bindFavAnchor); }
+
+    /* Escape-to-close for modals this script shows itself. wh-core
+     * binds its body-level Escape handler only from its own show()
+     * path, so a picker rendered directly into #overlay must wire its
+     * own. Bound once; coexists safely with wh-core's handler (both
+     * are idempotent hides). */
     let _favEscBound = false;
     function bindFavOverlayEscape () {
-        /* wh-core binds its body-level Escape handler only from its own
-         * show() path — a modal displayed by this fallback must bind its
-         * own. Bound once; coexists safely with wh-core's handler. */
         if (_favEscBound) return;
         _favEscBound = true;
         document.addEventListener('keydown', (e) => {
@@ -852,54 +1537,6 @@
         }, true);
     }
 
-    function showFavOverlay (view) {
-        try {
-            if (!view) return;
-            const ov = document.getElementById('overlay');
-            const inner = ov && ov.querySelector('.overlay-inner');
-            if (!ov || !inner) return;
-            bindFavOverlayEscape();
-            const jq = window.jQuery;
-            if (jq && jq.fn) jq(inner).html(view);   // same injection path as wh-core's T.html(view)
-            else inner.innerHTML = view;             // defensive fallback (no jQuery contexts)
-            ov.classList.remove('overlay-hidden');
-        } catch (e) { /* overlay is an enhancement — never fail the toggle */ }
-    }
-
-    /* Fallback toggle — v7.1.0's own request flow, used only when
-     * wh-core's overlay stack is missing (never on real wallhaven). */
-    async function favToggleFallback (fig, btn) {
-        const id = fig.getAttribute('data-wallpaper-id'); if (!id) return;
-        if (_favBusy.has(fig)) return;
-        _favBusy.add(fig);
-        btn.classList.remove('nx-pulse'); void btn.offsetWidth; btn.classList.add('nx-pulse');
-        const wasFav = btn.classList.contains('on');
-        const cur = favParseCount(btn);
-        const desired = !wasFav;
-        const target = desired ? cur + 1 : Math.max(0, cur - 1);
-        btn.dataset.favState = 'loading';
-        btn.setAttribute('aria-busy', 'true');
-        btn.title = desired ? 'Adding to favorites…' : 'Removing from favorites…';
-        try {
-            const result = await favRequest(id, desired);
-            const favorited = !!result.favorited;
-            favApply(id, favorited, favorited === wasFav ? cur : target);
-            showFavOverlay(result.view);
-            btn.dataset.favState = 'success';
-            setTimeout(() => { if (btn.isConnected) delete btn.dataset.favState; }, 700);
-        } catch (err) {
-            favApply(id, wasFav, cur);
-            btn.classList.add('nx-fav-err');
-            btn.dataset.favState = 'error';
-            btn.title = err && err.login ? 'Log in to Wallhaven to favorite' : 'Favorite failed — click to retry';
-            setTimeout(() => { if (btn.isConnected) btn.classList.remove('nx-fav-err'); }, 1600);
-            setTimeout(() => { if (btn.isConnected) delete btn.dataset.favState; }, 1800);
-        } finally {
-            btn.removeAttribute('aria-busy');
-            setTimeout(() => _favBusy.delete(fig), 400);
-        }
-    }
-
     /* Turn the card's star into the restyled native overlay-anchor.
      * Server truth (.faved) wins over the local mirror; the mirror
      * decides only when the page shows no .faved marker anywhere. */
@@ -910,10 +1547,12 @@
         const old = info && info.querySelector(':scope > .wall-favs');
         if (!id || !info || !old) return;
         const serverFaved = old.classList.contains('faved');
-        if (serverFaved) _favedSeen = true;
         const count = favParseCount(old);
-        /* Account state comes only from Wallhaven's server marker. */
-        const on = serverFaved;
+        /* The server marker is the freshest account hint — record it
+         * as a seed, then let the index upgrade it (a wallpaper in a
+         * custom collection the marker missed still counts as on). */
+        FavState.markSeed(id, serverFaved);
+        const on = FavState.isOn(id);
         let a;
         if (old.tagName !== 'A') {
             /* 0-favorite wallpapers render as a bare <span> — rebuild
@@ -942,11 +1581,13 @@
         a.setAttribute('tabindex', '0');
         a.setAttribute('aria-label', 'Favorite wallpaper');
         a.setAttribute('aria-pressed', String(on));
-        a.title = on ? 'Remove from favorites' : 'Add to favorites';
+        a.title = favTitleFor(on);
+        bindFavAnchor(a);
     }
 
     function upgradeVisibleFavoriteButtons () {
         document.querySelectorAll('figure.thumb').forEach(upgradeFavoriteButton);
+        bindAllFavAnchors();
     }
 
 
@@ -2188,16 +2829,19 @@
         /* v7.1.1: scan cards get the same native overlay-anchor the
          * grid cards use — one wire protocol for every favorite. */
         const favId = String(w.id);
-        /* Scan cards have no server-rendered account marker; never infer
-         * account membership from GM-local storage. */
-        const favOn = false;
+        /* Scan cards carry no server-rendered account marker — their
+         * star comes from FavState (server seeds + the cached,
+         * count-validated account index), and the first scan card
+         * schedules the background index build that keeps it true. */
+        FavState.ensureIndexSoon();
+        const favOn = FavState.isOn(favId);
         const fav = document.createElement('a');
         fav.className = 'jsAnchor overlay-anchor wall-favs nx-fav' + (favOn ? ' on' : '');
         fav.setAttribute('href', FAV_URL(favId));
         fav.setAttribute('data-href', FAV_URL(favId));
         fav.setAttribute('role', 'button');
         fav.setAttribute('tabindex', '0');
-        fav.title = favOn ? 'Remove from favorites' : 'Add to favorites';
+        fav.title = favTitleFor(favOn);
         fav.setAttribute('aria-label', 'Favorite wallpaper');
         fav.setAttribute('aria-pressed', String(favOn));
         fav.innerHTML = '<span class="nx-fav-n">' + (w.favorites || 0).toLocaleString() + '</span>' + IC.star;
@@ -2244,6 +2888,8 @@
             const frag = document.createDocumentFragment();
             _nativeItems.forEach(n => frag.appendChild(n.cloneNode(true)));
             ul.appendChild(frag);
+            bindAllFavAnchors();   // clones carry markup, not listeners
+            favRenderAll();          // …and snapshot markup may predate recent favorites
         } else ul.textContent = '';
         _seenIds.clear();
         setCount(document.querySelectorAll('figure.thumb[data-wallpaper-id]').length);
@@ -2861,7 +3507,7 @@
       '<div class="nx-sec-h">Search history <span class="nx-hspan">· keep <input id="nx-hm" class="nx-in nx-in-hm" type="number" min="1" step="1"> searches</span></div>' +
       '<div class="nx-hist" id="nx-hist"></div>' +
       '<div class="nx-hist-foot"><button type="button" class="nx-btn nx-btn-dim" id="nx-hist-clear">Clear history</button></div>' +
-      '<div class="nx-foot"><span>naXim Labs · Wallhaven Enhancer v7.1.2</span><a href="https://github.com/0naXim0" target="_blank" rel="noopener">github.com/0naXim0</a></div>' +
+      '<div class="nx-foot"><span>naXim Labs · Wallhaven Enhancer v7.1.3</span><a href="https://github.com/0naXim0" target="_blank" rel="noopener">github.com/0naXim0</a></div>' +
     '</div></div></div>';
 
     function chipsVal (box)   { return Array.prototype.map.call(box.children, c => c.classList.contains('on') ? '1' : '0').join(''); }
@@ -3244,6 +3890,15 @@ section.thumb-listing-page > ul > li, #thumbs > ul > li, ul#thumbs > li { margin
 figure.thumb { position:relative; border-radius:10px; background:#101216;
     transition:transform .18s ease, box-shadow .18s ease; }
 figure.thumb:hover { transform:translateY(-2px); box-shadow:0 12px 30px rgba(0,0,0,.45); }
+/* ── GLOBAL KILL — wallhaven's native per-thumb corner star. The green
+   .thumb-btn-unfav badge (rendered on every wallpaper you have favorited)
+   is always visible from the server HTML until the lazy hover-time
+   sanitizer reached the card. This rule keeps the corner star dead on
+   every page from the moment the stylesheet lands — load, hover, refresh,
+   and infinite-scroll additions alike. The enhancer's own .nx-fav star in
+   the bottom info bar is the single favorite affordance. */
+figure.thumb .thumb-btn.thumb-btn-fav,
+figure.thumb .thumb-btn.thumb-btn-unfav { display:none !important; }
 figure.thumb img { display:block; width:100%; height:auto; border-radius:10px; }
 figure.thumb .preview, figure.thumb .thumb-info { border-radius:0 0 10px 10px; }
 .nx-empty { flex:1 1 100%; width:100%; padding:26px 18px; text-align:center; color:#8d93a3; font-size:13px; }
@@ -3288,7 +3943,7 @@ figure.thumb .thumb-info .wall-favs {
 figure.thumb .thumb-info .wall-res { color:#c3cbd9 !important; pointer-events:none !important; cursor:default !important; }
 figure.thumb .thumb-info .nx-fav,
 figure.thumb .thumb-info .wall-favs { pointer-events:auto !important; cursor:pointer !important; transition:color .15s; }
-figure.thumb .thumb-info .nx-fav { position:relative !important; isolation:isolate; -webkit-user-select:none; user-select:none; -webkit-tap-highlight-color:transparent; transition:color .18s ease, transform .16s ease, filter .18s ease; }
+figure.thumb .thumb-info .nx-fav { position:relative !important; isolation:isolate; -webkit-user-select:none; user-select:none; -webkit-tap-highlight-color:transparent; touch-action:manipulation; -webkit-touch-callout:none; transition:color .18s ease, transform .16s ease, filter .18s ease; }
 figure.thumb .thumb-info .nx-fav::after { content:""; position:absolute; inset:-5px; z-index:-1;
     border-radius:50%; background:rgba(230,192,105,.14); opacity:0; transform:scale(.72);
     transition:opacity .18s ease, transform .18s cubic-bezier(.2,.8,.2,1); pointer-events:none; }
@@ -3296,6 +3951,11 @@ figure.thumb .thumb-info .nx-fav:hover::after,
 figure.thumb .thumb-info .nx-fav:focus-visible::after { opacity:1; transform:scale(1); }
 figure.thumb .thumb-info .nx-fav:hover { filter:brightness(1.08); }
 figure.thumb .thumb-info .nx-fav:active { transform:scale(.9); }
+/* Hold feedback — the glow fills over exactly the hold threshold (FAV_HOLD_MS).
+   Matches the :hover end-state, so mouse users see no change; touch users
+   get a visible “almost there” cue while pressing. */
+figure.thumb .thumb-info .nx-fav.nx-holding::after { opacity:1; transform:scale(1); transition-duration:.4s; }
+figure.thumb .thumb-info .nx-fav[aria-busy="true"]{cursor:progress}
 figure.thumb .thumb-info .nx-fav[data-fav-state="loading"] { color:#b8c9ef !important; cursor:default !important; opacity:.78; }
 figure.thumb .thumb-info .nx-fav[data-fav-state="loading"]::after { opacity:.38; transform:scale(1); }
 figure.thumb .thumb-info .nx-fav[data-fav-state="loading"] svg { animation:nx-fav-breathe .9s ease-in-out infinite; }
@@ -3587,6 +4247,56 @@ figure.thumb.nx-flash { animation:nx-flash .55s ease; }
     .nx-dlm-ring .nx-r-fg, .nx-dlm-rring .nx-r-fg { transition:none !important; }
     .nx-dlm.nx-open .nx-dlm-list { animation:none !important; }
 }
+#nx-fav-notice{position:fixed;right:22px;bottom:22px;z-index:2147483647;max-width:360px;padding:12px 16px;border:1px solid rgba(255,255,255,.16);border-radius:12px;background:rgba(18,22,30,.97);box-shadow:0 12px 34px rgba(0,0,0,.42);color:#eef3fb;font:600 13px/1.35 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;opacity:0;transform:translateY(10px);pointer-events:none;transition:opacity .18s,transform .18s}#nx-fav-notice.show{opacity:1;transform:none}#nx-fav-notice[data-kind="ok"]{border-color:rgba(125,220,160,.5)}#nx-fav-notice[data-kind="error"]{border-color:rgba(244,120,140,.6)}
+/* ─── Collection picker (rendered inside wallhaven's #overlay) ───
+   The close button fixes apply to EVERY .overlay-close on the page:
+   wallhaven's own CSS omits cursor:pointer there and its :hover
+   rule (".overlay-close :hover") targets the icon's children, so
+   closers looked and behaved like selectable text. */
+#overlay .overlay-close{display:flex;align-items:center;justify-content:center;width:36px;height:36px;padding:0;top:7px;right:7px;border-radius:9px;background:rgba(255,255,255,.05);color:#98a0b0;cursor:pointer !important;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;transition:color .15s,background .15s,transform .12s;z-index:30}
+#overlay .overlay-close:hover{color:#f2f5fa;background:rgba(247,118,142,.18)}
+#overlay .overlay-close:active{transform:scale(.92)}
+#overlay .overlay-close:focus-visible{outline:2px solid rgba(122,162,247,.85);outline-offset:1px}
+#overlay .overlay-close svg{width:15px;height:15px;display:block;pointer-events:none}
+#overlay .overlay-close i{font-size:15px;line-height:1;pointer-events:none}
+.nx-picker{width:400px;max-width:calc(100vw - 90px);padding:2px 2px 14px;color:#eef3fb;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;-webkit-user-select:none;user-select:none}
+.nx-picker-top{display:flex;align-items:center;gap:12px;padding:2px 4px 13px}
+.nx-picker-thumb{width:66px;height:42px;object-fit:cover;border-radius:6px;background:#101216;flex:none}
+.nx-picker-tt{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}
+.nx-picker-tt strong{font-size:13.5px;font-weight:700;letter-spacing:.2px;color:#f2f5fa;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.nx-picker-tt strong i{font-style:normal;color:#7d8798;font-weight:600;margin-left:6px;font-size:11px}
+.nx-picker-tt span{font-size:11.5px;color:#9aa5b5;line-height:1.45}
+.nx-picker-list{display:flex;flex-direction:column;gap:7px}
+.nx-picker-row{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid rgba(255,255,255,.1);border-radius:10px;background:rgba(255,255,255,.045);cursor:pointer;transition:background .15s,border-color .15s,transform .12s}
+.nx-picker-row:hover{border-color:rgba(255,255,255,.24);background:rgba(255,255,255,.07)}
+.nx-picker-row:active{transform:scale(.99)}
+.nx-picker-row:focus-visible{outline:2px solid rgba(122,162,247,.85);outline-offset:1px}
+.nx-picker-row.active{border-color:rgba(114,201,218,.55);background:rgba(55,144,166,.15)}
+.nx-picker-row.active:hover{background:rgba(55,144,166,.22)}
+.nx-picker-row.busy{opacity:.55;pointer-events:none}
+.nx-picker-row.current{border-color:rgba(151,208,137,.5);background:rgba(122,180,120,.07)}
+.nx-picker-row.current:hover{background:rgba(122,180,120,.12)}
+.nx-picker-row.current .nx-picker-name{color:#d9ecd6}
+.nx-picker-saved{flex:none;display:inline-flex;align-items:center;gap:5px;height:22px;padding:0 9px;border-radius:999px;background:rgba(122,180,120,.17);color:#a9d8a2;font-size:10px;font-weight:700;letter-spacing:.4px;cursor:default}
+.nx-picker-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:600;color:#e8edf6}
+.nx-picker-row.active .nx-picker-name{color:#dff3f7}
+.nx-picker-qs{flex:none;display:inline-flex;align-items:center;gap:6px;height:26px;padding:0 11px;border-radius:999px;border:1px solid rgba(255,255,255,.14);background:rgba(255,255,255,.04);color:#8f9aa9;font-size:10.5px;font-weight:700;letter-spacing:.4px;cursor:pointer;transition:color .15s,border-color .15s,background .15s,transform .12s}
+.nx-picker-qs svg{width:11px;height:11px;display:block;pointer-events:none;transition:fill .15s}
+.nx-picker-qs:hover{color:#d5dde8;border-color:rgba(255,255,255,.32);background:rgba(255,255,255,.09)}
+.nx-picker-qs:active{transform:scale(.95)}
+.nx-picker-qs:focus-visible{outline:2px solid rgba(122,162,247,.85);outline-offset:1px}
+.nx-picker-row.active .nx-picker-qs{color:#8fdcec;border-color:rgba(114,201,218,.6);background:rgba(55,144,166,.24)}
+.nx-picker-row.active .nx-picker-qs:hover{color:#bfeff8;background:rgba(55,144,166,.34)}
+.nx-picker-row.active .nx-picker-qs svg{fill:currentColor}
+.nx-picker-qs .nx-spin{width:10px;height:10px;border-width:2px;flex:none}
+.nx-picker-foot{margin-top:13px;padding-top:11px;border-top:1px solid rgba(255,255,255,.08);color:#8b96a6;font-size:11px;line-height:1.55}
+.nx-picker-foot b{color:#8fdcec;font-weight:700}
+.nx-picker-loading{display:flex;align-items:center;gap:11px;padding:24px 4px;color:#9aa5b5;font-size:12.5px}
+.nx-picker-error{padding:6px 4px 2px}
+.nx-picker-error p{margin:0 0 12px;color:#f0a7b5;font-size:12.5px;line-height:1.5}
+.nx-picker-retry{display:inline-flex;align-items:center;height:30px;padding:0 14px;border-radius:9px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#e8edf6;font-size:12px;font-weight:700;cursor:pointer;transition:background .15s,border-color .15s}
+.nx-picker-retry:hover{background:rgba(255,255,255,.1);border-color:rgba(255,255,255,.3)}
+.nx-picker-retry:focus-visible{outline:2px solid rgba(122,162,247,.85);outline-offset:1px}
 `;
 
     const addCss = css => {
@@ -3597,11 +4307,16 @@ figure.thumb.nx-flash { animation:nx-flash .55s ease; }
     /* ═══ INIT — guarded per-step bootstrap: failures print the exact failing step and never silence the rest. */
 
     const step = (name, fn) => { try { fn(); } catch (e) { console.error('[naXim Labs] init failed at: ' + name, e); } };
-    step('styles',   () => addCss(CSS));
+    step('styles',   () => { addCss(CSS); });
     step('hyperPill',() => { if (hyperPill && document.body) document.body.appendChild(hyperPill); });
     step('panel',   buildPanel);
     step('favoriteButtons', upgradeVisibleFavoriteButtons);
+    step('favoriteBindings', bindAllFavAnchors);
     step('pageSync',() => pageSync());
+    /* No favorite network I/O at boot: server .faved markers already
+     * render native cards, and the cached index is validated lazily
+     * (first scan card, picker open, or a removal that needs it). */
+    step('favIndex', () => { if (FavState.hasCache()) FavState.ensureIndexSoon(5000); });
     step('status',   () => setStatus('Ready · hover a card, then click the eye for an instant preview'));
     console.info('[naXim Labs] initialized');
 })();
