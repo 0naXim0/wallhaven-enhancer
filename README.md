@@ -7,6 +7,7 @@ A focused Tampermonkey userscript by **naXim Labs** (v7.3.1) that makes Wallhave
 - Add preview and original-download actions to wallpaper cards.
 - Open a full-screen, high-resolution preview without leaving the gallery.
 - Browse the current gallery with **Left / Right Arrow** keys.
+- Download wallpapers with filenames generated from the wallpaper’s tags on Wallhaven.
 - Download the original wallpaper with **D** or the Download button.
 - Open the native Wallhaven page from the preview.
 - Show resolution, category, and favorite-count metadata.
