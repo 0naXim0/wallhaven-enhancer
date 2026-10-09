@@ -6,8 +6,8 @@
 // @downloadURL  https://cdn.jsdelivr.net/gh/0naXim0/wallhaven-enhancer@main/wallhaven-enhancer.user.js
 // @updateURL    https://cdn.jsdelivr.net/gh/0naXim0/wallhaven-enhancer@main/wallhaven-enhancer.user.js
 // @supportURL   https://github.com/0naXim0
-// @version      7.3.1
-// @description  Byte-accurate downloads, instant previews, persistent HD Mode, smooth zoom & pan, unified cards, adaptive scanning, and a server-verified favorite/collection system with true add/remove semantics, a per-collection Quick-Save target and a hold-to-open collection picker. A naXim Labs product.
+// @version      7.5.1
+// @description  Byte-accurate downloads, instant previews, persistent HD Mode, smooth zoom & pan, unified cards, adaptive scanning, a server-verified favorite/collection system with true add/remove semantics, a per-collection Quick-Save target and a hold-to-open collection picker, and a crash-proof persistent download queue with cross-tab sync, retry, tunable parallelism, pause/resume and speed/ETA telemetry. A naXim Labs product.
 // @match        https://wallhaven.cc/*
 // @run-at       document-end
 // @noframes
@@ -18,12 +18,133 @@
 // @grant        GM_deleteValue
 // @grant GM_download
 // @grant GM_addValueChangeListener
+// @grant GM_notification
 // @connect      wallhaven.cc
 // @connect      w.wallhaven.cc
 // @connect      th.wallhaven.cc
 // ==/UserScript==
 
 // ════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════
+//  v7.5.1 — CONTROL POLISH — every button, working perfectly:
+//
+//    • SETTINGS MOVED TO THE TOP PANEL — a "Downloads" section in
+//      the naXim Labs panel (parallel downloads stepper, notify
+//      toggle, lifetime stats). The queue pane is action-only now:
+//      pause/resume, retry-all, clear-failed, clear-all. (The
+//      v7.5.0 drawer also had a dead toggle — its class landed on
+//      the wrong element, so it could never open.)
+//
+//    • TRUE PAUSE — Pause now actually stops the world: in-flight
+//      transfers are ABORTED and requeued at their FIFO position,
+//      in every tab, the instant you click. Files already in the
+//      save step (fully downloaded) land rather than restart, and
+//      resume picks the queue back up in order. The pill ring goes
+//      amber; rows say "paused".
+//
+//    • CLEAR-ALL — a trash button on the queue bar with a two-click
+//      inline confirm (arms red, times out — no modal, no clutter).
+//      Confirming removes EVERYTHING: rows, store, and executing
+//      transfers in every tab (tombstones ride the shared store).
+//      Lifetime stats survive; the queue restarts empty.
+//
+//  v7.5.0 — PARALLEL SETTINGS & TELEMETRY — the queue you can tune.
+//
+//  SETTINGS live in their own tiny store (gf_dlq_cfg_v1), separate
+//    from the queue envelope — changing a preference never churns
+//    queue revisions or disturbs executing transfers:
+//    • Parallel downloads: 1 by default (strictly one-by-one, FIFO);
+//      raise it live (up to 6) and the pump fills the new slots the
+//      same instant; lower it and in-flight transfers finish out
+//      naturally. The setting survives refresh and browser restarts
+//      and syncs across every open tab through its own value-change
+//      listener.
+//    • Pause / Resume holds the whole queue in every tab at once —
+//      adding a new download while paused auto-resumes (a fresh
+//      click is intent).
+//    • Notify when finished — one desktop notification (via
+//      GM_notification) the moment the queue drains, only when the
+//      page is hidden — never per-file spam. Off switch in settings.
+//    • Lifetime counters — files saved & bytes moved, all-time.
+//
+//  TELEMETRY, in the rows and the header: live per-file speed
+//    (smoothed EMA) with ETA and bytes moved, queue position for
+//    waiting items ("waiting — 3 of 9"), backoff countdowns for
+//    retries, error text inline on failed rows, an aggregate
+//    "N of M running · MB/s · %" status line, and an amber ring
+//    while paused.
+//
+//  BULK CONTROLS: Retry-all-failed and Clear-failed act on every
+//    failed row at once; the success UX is byte-for-byte unchanged.
+//
+//  v7.4.1 — INSTANT REFRESH FAILOVER — fixes restored downloads
+//    stuck on "wait" forever after a page refresh.
+//
+//    ROOT CAUSE: the dying page's pagehide requeue-write rides
+//    Tampermonkey's ASYNC storage bridge and can be dropped — the
+//    committed store then still shows items OWNED by the dead tab.
+//    Hydrate only healed meta/down/retry behind a STALE (75 s)
+//    registry entry, never a QUEUED item that still carried an
+//    owner, and the scheduler only claims OWNERLESS work. Result:
+//    every restored row sat on "wait" with no code path ever
+//    looking at it again.
+//
+//    FIX (layered, each layer independently sufficient):
+//    • Death notes — pagehide also drops a synchronous localStorage
+//      note (commits during unload even when the GM bridge dies);
+//      successors prove the predecessor dead INSTANTLY at hydrate.
+//    • Hydrate + watchdog now heal owned-QUEUED items too, and
+//      accept death via the ring or registry silence — a live
+//      heartbeat always vetoes, so a throttled background tab is
+//      never robbed mid-transfer.
+//    • Dead-owner items are claimable at pump time.
+//    • Livelocks exterminated: the claim timer is armed BEFORE the
+//      write whose same-tab echo re-enters pump; claims are capped
+//      by MAX_LIVE; a lost verify timer is unstuck by the
+//      watchdog; an unreadable store at verify keeps claims.
+//
+//  v7.4.0 — PERSISTENT DOWNLOAD QUEUE
+//
+//  THE download queue is no longer volatile. It lives in GM storage
+//    (gf_dlq_v1) as one versioned envelope — { v, rev, base, seq,
+//    items[], gone{} } — and is rebuilt on every load, so refreshes,
+//    tab closures and browser restarts no longer lose pending work.
+//
+//  ORDER is global and chronological: items serialize in (seq, id)
+//    order, the exact order wallpapers were added in across tabs;
+//    every append persists immediately before any await, so a crash
+//    between click and write can no longer swallow an add.
+//
+//  OWNERSHIP: the adding tab executes the transfer. Orphaned items
+//    (dead owner = no heartbeat for 75 s) are re-queued by a 20 s
+//    watchdog and claimed write-then-verify by a live tab, so exactly
+//    one tab ever moves a given file. pagehide requeues a tab's own
+//    in-flight items instantly (fast failover); pageshow reclaims
+//    them after a bfcache restore.
+//
+//  CROSS-TAB: GM_addValueChangeListener broadcasts every write;
+//    remote items are adopted (progress, state, order), executing
+//    items stay immune to stale snapshots (rev/base guard), and
+//    dismissals travel as tombstones so a removal is never mistaken
+//    for a lost update — or vice versa.
+//
+//  FAILURE: transient errors keep the auto-retry ladder (4 tries,
+//    700/1800/4200 ms); real failures PERSIST — red row, error
+//    detail, Retry and Dismiss. The direct-URL courtesy only fires
+//    when the SAVE step itself broke. Success behavior is exactly
+//    as before: the previewer fades out gracefully on completion.
+//
+//  EFFICIENCY: progress coalesces to >=1 s / >=5% deltas over a
+//    250 ms debounce; heartbeats only tick while a tab owns work;
+//    idle cost is one lightweight watchdog read. Object URLs are
+//    revoked on every exit path; nothing executable is ever
+//    persisted; the store is capped and TTL-pruned.
+//
+//  SELF-HEALING: corrupt JSON is backed up and reset; invalid or
+//    duplicate entries are dropped; done entries expire; stalled
+//    entries are detected and re-queued — the script never crashes
+//    or hangs on damaged storage.
+//
 // ════════════════════════════════════════════════════════════════
 //  v7.3.1 — GLOBAL KILL: WALLHAVEN'S NATIVE CORNER STAR
 //
@@ -296,7 +417,7 @@
 
 (function () {
     'use strict';
-    console.info('[naXim Labs] v7.3.1 executing');
+    console.info('[naXim Labs] v7.5.1 executing');
 
     /* ═══ PAGE DETECTION & BOOT GUARD ══════════════════════════════ */
 
@@ -395,6 +516,10 @@
             fit:    w('<polyline points="4 9 4 4 9 4"/><polyline points="20 9 20 4 15 4"/><polyline points="4 15 4 20 9 20"/><polyline points="20 15 20 20 15 20"/>'),
             plus:   w('<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>'),
             minus:  w('<line x1="5" y1="12" x2="19" y2="12"/>'),
+            retry:  w('<polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>'),
+            pause:  w('<rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/>'),
+            trash:  w('<polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/>', 1.9),
+            help:   w('<circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/>'),
             star:   '<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M12 1.7l3.1 6.5 7.1.9-5.2 4.9 1.3 7-6.3-3.4-6.3 3.4 1.3-7L1.8 9.1l7.1-.9z"/></svg>',
             github: '<svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>',
         };
@@ -1594,20 +1719,251 @@
     /* ═══ DOWNLOAD MANAGER — real circular progress ═══════════════ */
 
     const DL = (() => {
-        const MAX_TRIES = 4;
-        const BACKOFF   = [700, 1800, 4200];
-        const REVOKE_MS = 30000;
+        /* ═══ v7.5.0 SETTINGS + PARALLEL QUEUE + TELEMETRY ═════════
+         * The queue lives in GM storage and is rebuilt on every load —
+         * refreshes, tab closures and browser restarts no longer lose
+         * pending work.
+         *
+         * MODEL — one envelope (gf_dlq_v1): { v, rev, base, seq, items[], gone{} }
+         *   • items[] is the full queue in strict chronological order —
+         *     (seq, id) — the exact global order wallpapers were added
+         *     in, across tabs. The in-memory map mirrors that order.
+         *   • gone{} maps dismissed ids → timestamp (tombstones) so a
+         *     conscious removal is never mistaken for a stale
+         *     concurrent write, and vice versa (10-minute TTL).
+         *   • rev/base version every write and record the version it
+         *     started from, so a reader can tell whether a writer could
+         *     have even seen a given item (base >= the item's revAt).
+         *
+         * SETTINGS — a SECOND, tiny store (gf_dlq_cfg_v1) keeps user
+         *   preferences OUT of the queue envelope, so changing a
+         *   setting never churns queue revisions or disturbs executing
+         *   items: { conc, paused, notif, files, bytes }.
+         *   • conc — parallel transfers, 1..MAX_LIVE. Default 1 =
+         *     strictly one-by-one (FIFO), exactly as requested. Raise
+         *     it live and the pump fills the new slots immediately;
+         *     lower it and in-flight transfers finish naturally.
+         *   • paused — a TRUE pause: in-flight transfers are aborted
+         *     and requeued at their FIFO position (save-step files —
+         *     fully downloaded, mid-save — land instead of
+         *     restarting); every tab honors the hold the instant it
+         *     is set, through its own remote listener. Adding a new
+         *     download while paused auto-resumes: a fresh click is a
+         *     clear statement of intent.
+         *   • notif — desktop notification when the queue drains.
+         *   • files/bytes — lifetime counters, updated once per
+         *     completed file.
+         *   The settings UI lives in the TOP naXim Labs panel
+         *     (Downloads section); the queue pane is action-only —
+         *     pause/resume, retry-all, clear-failed, clear-all.
+         *     Settings sync cross-tab through their own value-change
+         *     listener — no echo loops, no queue-store traffic.
+         *
+         * OWNERSHIP — the tab that adds a download executes it. Items
+         * orphaned by a dead tab are re-claimed by a live one. Death is
+         * proven two ways: the localStorage death ring (pagehide drops
+         * a synchronous note — the async GM bridge can lose a dying
+         * page's last write, localStorage never does) or registry
+         * silence (TAB_STALE — a live heartbeat always vetoes, so a
+         * throttled background tab is never robbed mid-transfer).
+         * Claims are write-then-verify; executing items are immune to
+         * foreign merges — exactly one tab ever transfers a given file.
+         *
+         * WRITES — state transitions persist immediately (add, claim,
+         * retry, done, fail, dismiss); progress coalesces to >= 1 s or
+         * >= 5% deltas and rides a 250 ms debounce. GM_setValue failures
+         * degrade to volatile operation — never a crash. Object URLs
+         * are revoked on every exit path; nothing executable is ever
+         * persisted (no xhr handles, no blob URLs).
+         *
+         * FAILURES — transient errors keep the auto-retry ladder (4
+         * tries, 700/1800/4200 ms backoff). A really failed item STAYS:
+         * red row, error detail, Retry and Dismiss. Success behavior is
+         * unchanged: the previewer fades out gracefully on completion. */
 
-        const items = new Map();
+        /* Timing/policy knobs live here so the stress suite can run the
+         * REAL engine on fast-forward (window.__NX_DL_TEST__ override —
+         * never set in production). */
+        const DTC = Object.assign({
+            MAX_TRIES : 4,
+            BACKOFF   : [700, 1800, 4200],
+            REVOKE_MS : 30000,
+            GDL_REVOKE_MS : 5000,     /* grace after a native save completes */
+            MAX_LIVE  : 6,          /* absolute ceiling; the user setting lives in cfg */
+            FLUSH_MS  : 250,        /* write debounce */
+            PROG_MS   : 1000,       /* min progress-persist interval */
+            PROG_PCT  : 0.05,       /* min progress-persist delta */
+            CLAIM_MS  : 150,        /* claim verify window */
+            FADE_MS   : 500,        /* done-row grace before fading */
+            DONE_TTL  : 90000,      /* done entries linger for cross-tab sync */
+            TAB_STALE : 75000,      /* owner unseen this long = dead */
+            DIED_TTL  : 86400000,   /* death-note retention */
+            DIED_MAX   : 12,        /* death-note ring size */
+            HEARTBEAT : 10000,      /* liveness ping while owning work */
+            WATCHDOG  : 20000,      /* stall/reconcile sweep */
+            ITEM_CAP  : 400,        /* hard store bound */
+            GONE_TTL  : 600000,     /* tombstone lifetime */
+            K_Q       : 'gf_dlq_v1',
+            K_TABS    : 'gf_dltabs_v1',
+            K_CORRUPT : 'gf_dlq_corrupt_last',
+            K_DIED    : 'gf_dlq_died_v1',   /* localStorage death ring */
+            K_CFG     : 'gf_dlq_cfg_v1',    /* settings + lifetime stats */
+        }, (typeof window !== 'undefined' && window.__NX_DL_TEST__) || {});
+
+        const items = new Map();           /* id → item; map order = (seq, id) */
         const rows  = new Map();
+        const gone  = new Map();            /* dismissed ids → ts (tombstones) */
+        const progAt = new Map(), progPct = new Map();
         let root = null, pill = null, list = null, cnt = null, pfg = null;
-        let expanded = false, raf = 0;
+        let bar = null, rowsBox = null;
+        let pauseBtn = null, barInfo = null, rtaBtn = null, clrBtn = null, trashBtn = null;
+        let expanded = false, raf = 0, booted = false;
+        const TAB_ID = 't' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+        let rev = 0, base = 0, seq = 0;     /* store versions + global add counter */
+        let dirty = false, flushT = 0, claimT = 0, wdT = 0, hbT = 0, liveCount = 0;
         const PC = 2 * Math.PI * 15.5;
         const RC = 2 * Math.PI * 8;
+
+        /* ─── settings (separate tiny store) ─────────────────────── */
+
+        let cfg = cfgAdopt(GM_getValue(DTC.K_CFG, ''));
+
+        function cfgAdopt (raw) {
+            let o = null;
+            try { o = JSON.parse(raw); } catch {}
+            const c = { conc: 1, paused: false, notif: true, files: 0, bytes: 0 };
+            if (o && typeof o === 'object') {
+                const n = parseInt(o.conc, 10);
+                if (isFinite(n)) c.conc = Math.max(1, Math.min(DTC.MAX_LIVE, n));   /* clamp, never trust */
+                c.paused = !!o.paused;
+                c.notif = o.notif !== false;            /* default ON */
+                if (typeof o.files === 'number' && isFinite(o.files) && o.files >= 0 && o.files < 1e9)  c.files  = Math.floor(o.files);
+                if (typeof o.bytes === 'number' && isFinite(o.bytes) && o.bytes >= 0 && o.bytes < 1e15) c.bytes = Math.floor(o.bytes);
+            }
+            return c;
+        }
+        function cfgWrite () { try { GM_setValue(DTC.K_CFG, JSON.stringify(cfg)); } catch {} }
+        function concOf () { return Math.max(1, Math.min(DTC.MAX_LIVE, cfg.conc | 0)); }
+
+        const cfgSubs = [];                       /* settings consumers (top panel) */
+
+        function statsText () {
+            const f = cfg.files || 0;
+            return f + (f === 1 ? ' file saved · ' : ' files saved · ') + fmtBytes(cfg.bytes || 0) + ' all-time';
+        }
+        function snapshot () {
+            return { conc: cfg.conc, paused: cfg.paused, notif: cfg.notif,
+                     files: cfg.files, bytes: cfg.bytes, max: DTC.MAX_LIVE,
+                     statsText: statsText() };
+        }
+        function notifyCfg () { for (const cb of cfgSubs) { try { cb(); } catch {} } }
+        function onCfg (cb) { if (typeof cb === 'function') cfgSubs.push(cb); }
+
+        function holdWork () {
+            /* TRUE pause — abort my in-flight transfers and put them
+             * back at their FIFO position. Save-step files (gdl) are
+             * fully downloaded; they land, not restart. Aborted
+             * requests fire their stale handlers later, but every
+             * handler is state-guarded, so a late arrival can never
+             * double-fire a transition. */
+            let touched = false;
+            for (const it of items.values()) {
+                if (it.owner !== TAB_ID) continue;
+                if (it.state !== 'meta' && it.state !== 'down') continue;
+                if (it.gdl) continue;                       /* mid-save — let it land */
+                it.state = 'queued';
+                clearTimeout(it.backT); it.backT = 0; it.nextTryAt = 0;
+                it.spd = 0; it.pLoad = 0; it.loaded = 0; it.total = 0;
+                dropSlot(it);
+                const x = it.xhr; it.xhr = null;
+                if (x) { try { x.abort(); } catch {} }
+                touched = true;
+            }
+            if (touched) persistNow();
+            schedule();
+        }
+
+        function setCfg (patch) {
+            if (patch && typeof patch === 'object') {
+                if (patch.conc !== undefined) {
+                    const n = parseInt(patch.conc, 10);
+                    if (isFinite(n)) cfg.conc = Math.max(1, Math.min(DTC.MAX_LIVE, n));   /* clamp */
+                }
+                if (patch.paused !== undefined) {
+                    const p = !!patch.paused;
+                    if (p && !cfg.paused) { cfg.paused = true; holdWork(); }   /* rising edge: stop the world */
+                    else cfg.paused = p;
+                }
+                if (patch.notif  !== undefined) cfg.notif  = !!patch.notif;
+                cfgWrite();
+                refreshSettingsUI();
+                schedule(); pump();               /* new slots fill now; shrink takes effect as slots free */
+            }
+            return snapshot();
+        }
+        function onCfgRemote () {
+            const fresh = cfgAdopt(GM_getValue(DTC.K_CFG, ''));
+            const changed = fresh.conc !== cfg.conc || fresh.paused !== cfg.paused || fresh.notif !== cfg.notif;
+            const rising  = fresh.paused && !cfg.paused;
+            cfg = fresh;
+            if (rising) holdWork();              /* a pause is honored everywhere, instantly */
+            refreshSettingsUI();
+            if (changed) { schedule(); pump(); }
+        }
+        function refreshSettingsUI () {
+            if (pauseBtn) {
+                pauseBtn.innerHTML = cfg.paused ? IC.play : IC.pause;
+                pauseBtn.title = cfg.paused ? 'Resume queue' : 'Pause queue';
+                pauseBtn.setAttribute('aria-label', pauseBtn.title);
+                pauseBtn.setAttribute('aria-pressed', cfg.paused ? 'true' : 'false');
+            }
+            notifyCfg();                        /* top-panel settings repaint */
+        }
+
+        /* ─── UI ─────────────────────────────────────────────────── */
 
         function build () {
             root = mk('div', 'nx-dlm');
             list = mk('div', 'nx-dlm-list');
+
+            bar = mk('div', 'nx-dlm-bar');
+            pauseBtn = mk('button', 'nx-dlm-act nx-pause'); pauseBtn.type = 'button';
+            pauseBtn.addEventListener('click', () => setCfg({ paused: !cfg.paused }));
+            barInfo = mk('span', 'nx-dlm-info');
+            rtaBtn = mk('button', 'nx-dlm-act nx-rta'); rtaBtn.type = 'button';
+            rtaBtn.title = 'Retry all failed'; rtaBtn.setAttribute('aria-label', 'Retry all failed downloads');
+            rtaBtn.innerHTML = IC.retry;
+            rtaBtn.addEventListener('click', () => retryAll());
+            rtaBtn.hidden = true;
+            clrBtn = mk('button', 'nx-dlm-act nx-clr'); clrBtn.type = 'button';
+            clrBtn.title = 'Clear failed'; clrBtn.setAttribute('aria-label', 'Clear failed downloads');
+            clrBtn.innerHTML = IC.x;
+            clrBtn.addEventListener('click', () => clearFailed());
+            clrBtn.hidden = true;
+            trashBtn = mk('button', 'nx-dlm-act nx-trash'); trashBtn.type = 'button';
+            trashBtn.title = 'Clear all'; trashBtn.setAttribute('aria-label', 'Clear all downloads');
+            trashBtn.innerHTML = IC.trash;
+            let armT = 0;                        /* two-step confirm: no modal, no clutter */
+            const disarm = () => {
+                clearTimeout(armT); armT = 0;
+                trashBtn.classList.remove('nx-armed');
+                trashBtn.title = 'Clear all'; trashBtn.setAttribute('aria-label', 'Clear all downloads');
+                trashBtn.innerHTML = IC.trash;
+            };
+            trashBtn.addEventListener('click', () => {
+                if (trashBtn.classList.contains('nx-armed')) { disarm(); clearAll(); return; }
+                trashBtn.classList.add('nx-armed');
+                trashBtn.title = 'Click again to clear everything';
+                trashBtn.setAttribute('aria-label', 'Clear all downloads — click again to confirm');
+                trashBtn.innerHTML = IC.help;
+                armT = setTimeout(disarm, 2600);
+            });
+            bar.append(pauseBtn, barInfo, rtaBtn, clrBtn, trashBtn);
+
+            rowsBox = mk('div', 'nx-dlm-rows');
+
+            list.append(bar, rowsBox);
+
             pill = mk('button', 'nx-dlm-pill'); pill.type = 'button';
             pill.setAttribute('aria-label', 'Download activity');
             pill.setAttribute('aria-expanded', 'false');
@@ -1627,12 +1983,30 @@
             });
             root.append(list, pill);
             document.body.appendChild(root);
+            refreshSettingsUI();
         }
 
         function fmtBytes (b) {
             if (!b || b < 1024) return (b || 0) + ' B';
             if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
-            return (b / 1048576).toFixed(1) + ' MB';
+            if (b < 1073741824) return (b / 1048576).toFixed(1) + ' MB';
+            return (b / 1073741824).toFixed(2) + ' GB';
+        }
+        function fmtRate (bpm) {                  /* bytes per millisecond → human */
+            const bs = (bpm || 0) * 1000;
+            if (bs < 1024) return Math.max(0, Math.round(bs)) + ' B/s';
+            if (bs < 1048576) return (bs / 1024).toFixed(1) + ' KB/s';
+            if (bs < 1073741824) return (bs / 1048576).toFixed(1) + ' MB/s';
+            return (bs / 1073741824).toFixed(2) + ' GB/s';
+        }
+        function fmtDur (ms) {
+            if (ms < 1000) return '<1s';
+            const s = Math.round(ms / 1000);
+            if (s < 60) return s + 's';
+            const m = Math.floor(s / 60);
+            if (m < 60) return m + 'm ' + (s % 60) + 's';
+            const h = Math.floor(m / 60);
+            return h + 'h ' + (m % 60) + 'm';
         }
 
         function setRing (fg, C, p, indet) {
@@ -1641,65 +2015,130 @@
         }
 
         function aggregate () {
-            let loaded = 0, total = 0, unknown = false, active = 0;
+            let loaded = 0, total = 0, unknown = false, failed = 0, visible = 0, done = 0, waiting = 0, speed = 0;
             for (const it of items.values()) {
-                if (it.state === 'done' || it.state === 'fail') continue;
-                active++;
+                if (it.uiGone) continue;
+                visible++;
+                if (it.state === 'done') { done++; continue; }
+                if (it.state === 'fail') { failed++; continue; }
+                if (it.state === 'queued' || it.state === 'retry') waiting++;
+                else speed += it.spd || 0;                     /* meta/down */
                 if (it.total > 0) { loaded += it.loaded; total += it.total; }
                 else unknown = true;
             }
-            return { active, p: total > 0 ? loaded / total : (unknown ? -1 : 0) };
+            return { active: visible - done - failed, exec: visible - done - failed - waiting,
+                     waiting, done, failed, visible, speed,
+                     p: total > 0 ? loaded / total : (unknown ? -1 : 0) };
         }
 
         function schedule () {
             if (raf) return;
-            raf = requestAnimationFrame(() => { raf = 0; render(); });
+            raf = window.requestAnimationFrame(() => { raf = 0; render(); });
         }
 
         function collapse () {
             expanded = false;
             if (root) { root.classList.remove('nx-open'); root.classList.remove('on'); }
             if (pill) pill.setAttribute('aria-expanded', 'false');
-            if (list) list.textContent = '';
+            if (rowsBox) rowsBox.textContent = '';
             rows.clear();
         }
 
         function render () {
             if (!root) return;
-            if (!items.size) { collapse(); return; }
-            root.classList.add('on');
             const a = aggregate();
-            cnt.textContent = String(items.size);
+            root.classList.toggle('nx-paused', cfg.paused);
+            if (!a.visible) { collapse(); return; }
+            root.classList.add('on');
+            cnt.textContent = String(a.visible);
             if (a.active === 0) setRing(pfg, PC, 1, false);
             else if (a.p < 0)   setRing(pfg, PC, 0, true);
-            else                 setRing(pfg, PC, a.p, false);
-            pill.title = a.active
-                ? (a.p >= 0 ? 'Downloading · ' + Math.round(a.p * 100) + '%' : 'Downloading…') +
-                  ' · ' + items.size + ' item' + (items.size > 1 ? 's' : '')
-                : 'Downloads complete';
+            else                setRing(pfg, PC, a.p, false);
+            pill.title = cfg.paused && a.active
+                ? 'Paused — ' + a.active + ' item' + (a.active > 1 ? 's' : '') + ' waiting'
+                : a.active
+                    ? 'Downloading ' + a.exec + ' of ' + a.active +
+                      (a.p >= 0 ? ' · ' + Math.round(a.p * 100) + '%' : '') +
+                      (a.speed > 0 ? ' · ' + fmtRate(a.speed) : '')
+                    : (a.failed
+                         ? a.failed + ' download' + (a.failed > 1 ? 's' : '') + ' failed — open for Retry'
+                         : 'Downloads complete');
             if (!expanded) {
-                if (rows.size) { list.textContent = ''; rows.clear(); }
+                if (rows.size) { rowsBox.textContent = ''; rows.clear(); }
                 return;
             }
+            if (rtaBtn) rtaBtn.hidden = a.failed === 0;
+            if (clrBtn) clrBtn.hidden = a.failed === 0;
+            if (trashBtn) trashBtn.disabled = a.visible === 0;
+            if (barInfo) {
+                if (cfg.paused && a.active) barInfo.textContent = 'paused — ' + a.active + ' waiting';
+                else if (a.exec > 0) {
+                    let t = a.exec + ' of ' + a.active + ' running';
+                    if (a.speed > 0) t += ' · ' + fmtRate(a.speed);
+                    if (a.p >= 0)    t += ' · ' + Math.round(a.p * 100) + '%';
+                    barInfo.textContent = t;
+                }
+                else if (a.failed > 0) barInfo.textContent = a.failed + ' failed';
+                else if (a.done  > 0) barInfo.textContent = 'complete';
+                else barInfo.textContent = '';
+            }
+            /* waiting positions — computed once per render, in queue order */
+            const wpos = new Map();
+            let wtot = 0;
             for (const it of items.values()) {
+                if (it.uiGone || it.state !== 'queued') continue;
+                wpos.set(it.id, ++wtot);
+            }
+            const now = Date.now();
+            for (const it of items.values()) {
+                if (it.uiGone) continue;
                 const r = ensureRow(it);
                 r.row.dataset.st = it.state;
                 if (it.name && r.nm.textContent !== it.name) { r.nm.textContent = it.name; r.nm.title = it.name; }
+                r.row.title = (it.name || 'wallhaven-' + it.id) + (it.err ? ' — ' + it.err : '');
+                let sub = '';
+                if (it.state === 'queued') {
+                    const p = wpos.get(it.id) || 0;
+                    sub = (cfg.paused ? 'paused' : 'waiting') +
+                          (wtot > 1 && p ? ' — ' + p + ' of ' + wtot : '');
+                }
+                else if (it.state === 'meta')   sub = 'resolving…';
+                else if (it.state === 'retry')  sub = 'retry ' + it.tries + '/' + DTC.MAX_TRIES +
+                                                       (it.nextTryAt > now ? ' in ' + fmtDur(it.nextTryAt - now) : '');
+                else if (it.state === 'done')   sub = 'saved' + (it.total > 0 ? ' · ' + fmtBytes(it.total) : '');
+                else if (it.state === 'fail')   sub = it.err || 'failed';
+                else {
+                    const parts = [];
+                    if (it.total > 0) parts.push(fmtBytes(it.loaded) + ' of ' + fmtBytes(it.total));
+                    else if (it.loaded > 0) parts.push(fmtBytes(it.loaded));
+                    if (it.spd > 0) {
+                        parts.push(fmtRate(it.spd));
+                        if (it.total > it.loaded) {
+                            const e = (it.total - it.loaded) / it.spd;
+                            if (isFinite(e) && e > 0) parts.push(fmtDur(e) + ' left');
+                        }
+                    }
+                    sub = parts.length ? parts.join(' · ') : 'starting…';
+                }
+                if (r.sub.textContent !== sub) r.sub.textContent = sub;
                 if (it.state === 'retry')       r.pct.textContent = '↻' + it.tries;
                 else if (it.state === 'meta')   r.pct.textContent = '…';
+                else if (it.state === 'queued') r.pct.textContent = 'wait';
                 else if (it.state === 'done')   r.pct.textContent = '100%';
                 else if (it.state === 'fail')   r.pct.textContent = 'failed';
                 else if (it.total > 0)          r.pct.textContent = Math.min(100, Math.round(it.loaded / it.total * 100)) + '%';
                 else                            r.pct.textContent = fmtBytes(it.loaded);
-                if (it.state === 'done')            setRing(r.fg, RC, 1, false);
-                else if (it.state === 'fail')       setRing(r.fg, RC, 0, false);
-                else if (it.total > 0)              setRing(r.fg, RC, it.loaded / it.total, false);
-                else                                setRing(r.fg, RC, 0, true);
-                const busy = it.state === 'meta' || it.state === 'down' || it.state === 'retry';
-                r.xb.style.display = busy ? '' : 'none';
+                if (it.state === 'done')        setRing(r.fg, RC, 1, false);
+                else if (it.state === 'fail')   setRing(r.fg, RC, 0, false);
+                else if (it.state === 'queued') setRing(r.fg, RC, 0, false);
+                else if (it.total > 0)          setRing(r.fg, RC, it.loaded / it.total, false);
+                else                            setRing(r.fg, RC, 0, true);
+                const busy = it.state === 'meta' || it.state === 'down' || it.state === 'retry' || it.state === 'queued';
+                r.xb.style.display = (busy || it.state === 'fail') ? '' : 'none';
+                r.rt.style.display = it.state === 'fail' ? '' : 'none';
             }
             for (const [id, r] of [...rows]) {
-                if (!items.has(id)) { r.row.remove(); rows.delete(id); }
+                if (!items.has(id) || items.get(id).uiGone) { r.row.remove(); rows.delete(id); }
             }
         }
 
@@ -1709,92 +2148,416 @@
             const row = mk('div', 'nx-dlm-row');
             const th = mk('img', 'nx-dlm-thumb');
             th.src = it.thumb; th.alt = ''; th.loading = 'lazy';
+            const col = mk('div', 'nx-dlm-col');
             const nm = mk('span', 'nx-dlm-id');
             nm.textContent = it.name || ('wallhaven-' + it.id);
             nm.title = nm.textContent;
+            const sub = mk('span', 'nx-dlm-sub');
+            col.append(nm, sub);
             const pct = mk('span', 'nx-dlm-pct');
             const ring = mk('span', 'nx-dlm-rring');
             ring.innerHTML = '<svg viewBox="0 0 20 20"><circle class="nx-r-bg" cx="10" cy="10" r="8"/><circle class="nx-r-fg" cx="10" cy="10" r="8"/></svg>';
             const fg = ring.querySelector('.nx-r-fg');
             fg.style.strokeDasharray = RC.toFixed(2);
             fg.style.strokeDashoffset = RC.toFixed(2);
+            const rt = mk('button', 'nx-dlm-x nx-dlm-rt'); rt.type = 'button';
+            rt.title = 'Retry download'; rt.setAttribute('aria-label', 'Retry download');
+            rt.innerHTML = IC.retry;
+            rt.addEventListener('click', (ev) => { ev.stopPropagation(); retry(it.id); });
             const xb = mk('button', 'nx-dlm-x'); xb.type = 'button';
             xb.title = 'Cancel download'; xb.setAttribute('aria-label', 'Cancel download');
             xb.innerHTML = IC.x;
             xb.addEventListener('click', (ev) => { ev.stopPropagation(); cancel(it.id); });
-            row.append(th, nm, pct, ring, xb);
-            list.appendChild(row);
-            r = { row, nm, pct, fg, xb };
+            row.append(th, col, pct, ring, rt, xb);
+            rowsBox.appendChild(row);
+            r = { row, nm, sub, pct, fg, xb, rt };
             rows.set(it.id, r);
             return r;
         }
+
+        /* ─── persistence ─────────────────────────────────────────── */
+
+        function qRead () {
+            let env = null;
+            try { env = JSON.parse(GM_getValue(DTC.K_Q, '')); } catch { env = null; }
+            if (!env || typeof env !== 'object' || !Array.isArray(env.items)) return null;
+            if (typeof env.rev === 'number' && env.rev > base) base = env.rev;
+            return env;
+        }
+
+        function persistOf (it) {
+            return { id: it.id, seq: it.seq, state: it.state, name: it.name || '',
+                     thumb: it.thumb || '', loaded: it.loaded || 0, total: it.total || 0,
+                     tries: it.tries || 0, err: it.err || '', addedAt: it.addedAt || 0,
+                     doneAt: it.doneAt || 0, owner: it.owner || '', ownerAt: it.ownerAt || 0 };
+        }
+
+        function qWrite () {
+            try {
+                rev = Math.max(rev, base) + 1;
+                const env = { v: 1, rev: rev, base: base, seq: seq, items: [], gone: {} };
+                for (const it of items.values()) { env.items.push(persistOf(it)); it.revAt = rev; }
+                for (const [id, ts] of gone) if (Date.now() - ts < DTC.GONE_TTL) env.gone[id] = ts;
+                GM_setValue(DTC.K_Q, JSON.stringify(env));
+                touchTabs();
+            } catch (e) { /* storage broken → keep running volatile */ }
+        }
+
+        function persistNow () { dirty = false; clearTimeout(flushT); flushT = 0; qWrite(); }
+        function persistSoon () { dirty = true; if (!flushT) flushT = setTimeout(flushDebounced, DTC.FLUSH_MS); }
+        function flushDebounced () { flushT = 0; if (!dirty) return; dirty = false; qWrite(); }
+
+        function persistProgress (it) {
+            const now = Date.now();
+            const frac = it.total > 0 ? it.loaded / it.total : 0;
+            const lastAt = progAt.get(it.id) || 0;
+            const lastPct = progPct.get(it.id) || 0;
+            if (now - lastAt < DTC.PROG_MS && frac - lastPct < DTC.PROG_PCT && frac < 1) return;
+            progAt.set(it.id, now); progPct.set(it.id, frac);
+            persistSoon();
+        }
+
+        /* ─── tabs registry (liveness) ────────────────────────────── */
+
+        function readTabs () {
+            try { const v = JSON.parse(GM_getValue(DTC.K_TABS, '{}')); return v && typeof v === 'object' ? v : {}; }
+            catch { return {}; }
+        }
+        function touchTabs (when) {
+            try {
+                const t = readTabs();
+                const now = when || Date.now();
+                for (const k of Object.keys(t)) if (now - t[k] > DTC.TAB_STALE * 3) delete t[k];
+                t[TAB_ID] = now;
+                GM_setValue(DTC.K_TABS, JSON.stringify(t));
+            } catch {}
+        }
+
+        /* ─── death notes — unload-proof liveness ──────────────────
+         * GM_setValue rides an async bridge (the extension's service
+         * worker) that can drop a dying page's very last write, so a
+         * refresh can leave the committed store still owned by the
+         * dead tab — freshly stamped, indistinguishable from "alive
+         * but quiet" for TAB_STALE seconds. localStorage writes are
+         * synchronous and commit during unload, so the dying page
+         * drops a note there instead: provable, instant death for
+         * every successor. Same-origin, so every wallhaven tab
+         * shares the ring. */
+        function diedRead () {
+            let ring = null;
+            try { ring = JSON.parse(localStorage.getItem(DTC.K_DIED) || '[]'); } catch {}
+            if (!Array.isArray(ring)) ring = [];
+            const out = new Map();
+            const now = Date.now();
+            for (const e of ring) {
+                if (!e || typeof e.t !== 'string' || typeof e.at !== 'number') continue;
+                if (now - e.at > DTC.DIED_TTL) continue;
+                out.set(e.t, e.at);
+            }
+            return out;
+        }
+        function diedWrite (ring) {
+            try {
+                localStorage.setItem(DTC.K_DIED,
+                    JSON.stringify([...ring.entries()].map(x => ({ t: x[0], at: x[1] }))));
+            } catch {}
+        }
+        function noteDeath (tab) {
+            try {
+                const ring = diedRead();                 /* re-note = move to freshest */
+                ring.delete(tab);
+                ring.set(tab, Date.now());
+                while (ring.size > DTC.DIED_MAX) ring.delete(ring.keys().next().value);
+                diedWrite(ring);
+            } catch {}
+        }
+        function clearDeath (tab) {
+            try {
+                const ring = diedRead();
+                if (ring.delete(tab)) diedWrite(ring);
+            } catch {}
+        }
+        function ownerDead (owner, tabs, died) {
+            if (!owner) return true;                          /* ownerless = adoptable */
+            if (died && died.has(owner)) return true;         /* provable death — beats a
+                                                  * fresh registry (pagehide case) */
+            const beat = tabs ? tabs[owner] : 0;
+            return !beat || Date.now() - beat > DTC.TAB_STALE;   /* registry silence */
+        }
+        function livenessCtx () {
+            return { tabs: readTabs(), died: diedRead() };
+        }
+
+        /* ─── validation & hydration (self-healing load) ──────────── */
+
+        const ST_RE = /^(queued|meta|down|retry|done|fail)$/;
+        const ID_RE = /^[a-z0-9]{2,12}$/i;
+        function validItem (o) {
+            return !!o && typeof o === 'object' && typeof o.id === 'string' && ID_RE.test(o.id) &&
+                   typeof o.state === 'string' && ST_RE.test(o.state) &&
+                   typeof o.seq === 'number' && isFinite(o.seq);
+        }
+
+        function adoptItem (o, revAt) {
+            const it = { id: o.id, seq: o.seq || 0, state: o.state, name: o.name || '',
+                         thumb: o.thumb || deriveThumb(o.id), loaded: o.loaded || 0, total: o.total || 0,
+                         tries: o.tries || 0, err: o.err || '', addedAt: o.addedAt || Date.now(),
+                         doneAt: o.doneAt || 0, owner: o.owner || '', ownerAt: o.ownerAt || 0,
+                         revAt: revAt || 0, uiGone: o.state === 'done',
+                         cbs: null, started: false, xhr: null, gdl: null, backT: 0, revT: 0,
+                         fadeT: 0, blobUrl: '', cancelled: false, claimPend: false, slot: false,
+                         spd: 0, pLoad: 0, pAt: 0, nextTryAt: 0 };
+            items.set(it.id, it);
+            return it;
+        }
+
+        function resort () {
+            const arr = [...items.values()].sort((a, b) => a.seq - b.seq || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+            items.clear();
+            for (const it of arr) items.set(it.id, it);
+        }
+
+        function hydrate () {
+            const raw = GM_getValue(DTC.K_Q, '');
+            if (!raw) return;
+            let env = null;
+            try { env = JSON.parse(raw); } catch { env = null; }
+            if (!env || typeof env !== 'object' || !Array.isArray(env.items)) {
+                try { GM_setValue(DTC.K_CORRUPT, String(raw).slice(0, 20000)); GM_deleteValue(DTC.K_Q); } catch {}
+                console.warn('[naXim Labs] download-queue store was corrupt — backed up and reset');
+                return;
+            }
+            const tabs = readTabs();
+            const died = diedRead();
+            const now = Date.now();
+            const seen = new Set();
+            let dropped = 0;
+            for (const o of env.items) {
+                if (!validItem(o) || seen.has(o.id)) { dropped++; continue; }
+                if (env.gone && env.gone[o.id]) { dropped++; continue; }          /* tombstoned */
+                seen.add(o.id);
+                if (typeof o.addedAt !== 'number' || !isFinite(o.addedAt) || o.addedAt > now + 60000) o.addedAt = now;
+                if (o.state === 'done' && (!o.doneAt || now - o.doneAt > DTC.DONE_TTL)) { dropped++; continue; }
+                /* dead owner → back in line. Covers meta/down/retry AND an
+                 * owned-QUEUED item (a claim that outlived its tab — the
+                 * eternal-"wait" hole). Death is proven three ways: the
+                 * localStorage ring (instant, unload-proof), registry
+                 * silence, or an expired per-item lease. */
+                if ((o.state === 'meta' || o.state === 'down' || o.state === 'retry' ||
+                     (o.state === 'queued' && o.owner)) &&
+                    ownerDead(o.owner, tabs, died)) {
+                    o.state = 'queued'; o.owner = ''; o.ownerAt = 0;
+                    o.loaded = 0; o.total = 0;
+                }
+                if (o.seq > seq) seq = o.seq;
+                adoptItem(o, env.rev || 0);
+            }
+            if (env.gone && typeof env.gone === 'object')
+                for (const [id, ts] of Object.entries(env.gone)) if (typeof ts === 'number') gone.set(id, ts);
+            if (typeof env.rev === 'number' && env.rev > rev) rev = env.rev;
+            base = rev;
+            resort();
+            if (dropped || items.size) qWrite();      /* heal the store, stamp my base */
+        }
+
+        /* ─── lifecycle helpers ───────────────────────────────────── */
+
+        function liveState (s) { return s === 'queued' || s === 'meta' || s === 'down' || s === 'retry'; }
+        function iOwn () {
+            for (const it of items.values()) if (it.owner === TAB_ID && liveState(it.state)) return true;
+            return false;
+        }
+
+        function killItem (id) {
+            const it = items.get(id);
+            if (it) {
+                if (it.xhr) { try { it.xhr.abort && it.xhr.abort(); } catch {} }
+                if (it.gdl) { try { it.gdl.abort && it.gdl.abort(); } catch {} }
+                clearTimeout(it.backT);
+                clearTimeout(it.fadeT);
+                dropSlot(it);
+            }
+            items.delete(id);
+            const r = rows.get(id);
+            if (r) { r.row.remove(); rows.delete(id); }
+        }
+
+        function prune () {
+            const now = Date.now();
+            let changed = false;
+            for (const [id, ts] of [...gone]) if (now - ts > DTC.GONE_TTL) { gone.delete(id); changed = true; }
+            for (const it of [...items.values()]) {
+                if (it.state === 'done' && now - (it.doneAt || 0) > DTC.DONE_TTL) { killItem(it.id); changed = true; }
+            }
+            let guard = 0;
+            while (items.size > DTC.ITEM_CAP && guard++ < 1000) {
+                let victim = null;
+                for (const it of items.values()) {
+                    if (it.state !== 'done') continue;
+                    if (!victim || (it.doneAt || 0) < (victim.doneAt || 0)) victim = it;
+                }
+                if (!victim) break;
+                killItem(victim.id); changed = true;
+            }
+            for (const k of [...progAt.keys()]) if (!items.has(k)) { progAt.delete(k); progPct.delete(k); }
+            return changed;
+        }
+
+        function armDoneFade (it) {
+            if (it.fadeT) return;
+            it.fadeT = setTimeout(() => {
+                it.fadeT = 0; it.uiGone = true;
+                const r = rows.get(it.id); if (r) { r.row.remove(); rows.delete(it.id); }
+                schedule();
+            }, DTC.FADE_MS);
+        }
+
+        /* ─── completion notification (hidden-tab courtesy) ──────── */
+
+        let prevWork = 0, notified = false, drainDone = 0, drainFail = 0;
+        function maybeNotify () {
+            let work = 0, failN = 0;
+            for (const it of items.values()) {
+                if (it.uiGone) continue;
+                if (liveState(it.state)) work++;
+                else if (it.state === 'fail') failN++;
+            }
+            if (work > 0) { notified = false; drainDone = 0; drainFail = 0; }
+            else if (!notified && prevWork > 0 && (drainDone + drainFail) > 0) {
+                notified = true;
+                if (cfg.notif && document.hidden) {
+                    try {
+                        if (typeof GM_notification === 'function') {
+                            GM_notification({
+                                title: 'naXim Labs — queue complete',
+                                text: drainDone + (drainDone === 1 ? ' download finished' : ' downloads finished') +
+                                      (drainFail ? (' · ' + drainFail + ' failed') : ''),
+                                timeout: 6000,
+                                onclick () { try { window.focus(); } catch {} },
+                            });
+                        }
+                    } catch {}
+                }
+            }
+            prevWork = work;
+        }
+
+        /* ─── scheduler: FIFO slots + cross-tab claims ────────────── */
+
+        function nextRunnable (ctx) {
+            if (!ctx) ctx = livenessCtx();
+            for (const it of items.values()) {
+                if (it.cancelled || it.state !== 'queued' || it.claimPend) continue;
+                if (it.owner === TAB_ID) return { it: it, claim: false };
+                if (ownerDead(it.owner, ctx.tabs, ctx.died))
+                    return { it: it, claim: true };    /* provably dead owner → claimable */
+            }
+            return null;
+        }
+        function takeSlot (it) { if (it.slot) return; it.slot = true; liveCount++; }
+        function dropSlot (it) { if (!it.slot) return; it.slot = false; liveCount--; }
+
+        function pump () {
+            if (claimT) return;
+            maybeNotify();
+            if (cfg.paused) return;                /* queue held — in-flight items finish naturally;
+                                                    * adding a new download auto-resumes */
+            const ctx = livenessCtx();
+            let pending = 0;                       /* pending claims hold capacity */
+            while (liveCount + pending < concOf()) {
+                const n = nextRunnable(ctx);
+                if (!n) break;
+                if (n.claim) {
+                    n.it.claimPend = true; n.it.owner = TAB_ID; n.it.ownerAt = Date.now();
+                    pending++;
+                    continue;
+                }
+                n.it.state = 'meta';
+                takeSlot(n.it);
+                run(n.it);
+            }
+            if (pending) {
+                claimT = setTimeout(verifyClaims, DTC.CLAIM_MS);  /* arm FIRST — qWrite's
+                                                    same-tab echo re-enters pump */
+                qWrite();                                        /* publish the claim */
+            }
+        }
+
+        function verifyClaims () {
+            claimT = 0;
+            const env = qRead();
+            for (const it of [...items.values()]) {
+                if (!it.claimPend) continue;
+                it.claimPend = false;
+                if (!env) continue;               /* store unreadable — no rival evidence
+                                                  * beats a local claim: keep it, keep working */
+                const ext = env.items.find(x => x.id === it.id);
+                if (!ext) { killItem(it.id); continue; }         /* dismissed while pending */
+                if (ext.owner !== TAB_ID) mergeOne(ext, env.rev || 0);   /* a live rival won */
+            }
+            schedule(); pump();
+        }
+
+        /* ─── transfer machinery ─────────────────────────────────── */
 
         function fire (it, ev) {
             const cb = it.cbs && it.cbs[ev];
             if (cb) { try { cb(); } catch {} }
         }
 
-        function add (id, cbs) {
-            const cur = items.get(id);
-            if (cur) {
-                if (cbs) {
-                    if (cur.started && cbs.onStart) { try { cbs.onStart(); } catch {} }
-                    else cur.cbs = Object.assign({}, cur.cbs, cbs);
-                }
-                schedule();
-                return;
-            }
-            const it = { id, cbs: cbs || null, state: 'meta', tries: 0, started: false,
-                         name: '', thumb: deriveThumb(id), loaded: 0, total: 0,
-                         xhr: null, gdl: null, backT: 0, revT: 0, blobUrl: '',
-                         cancelled: false };
-            items.set(id, it);
-            if (!root) build();
-            root.classList.add('on');
-            schedule();
-            run(it);
-        }
-
         async function run (it) {
             let m = null;
             try { m = await fetchWallData(it.id); } catch {}
             if (!items.has(it.id) || it.cancelled) return;
-            if (!m || !m.path) { finish(it, 'fail'); return; }
+            if (it.owner !== TAB_ID || it.state !== 'meta') return;   /* requeued/lost while awaiting */
+            if (!m || !m.path) { it.err = 'wallpaper data unavailable'; failed(it, null, new Error('meta')); return; }
             it.name = mkFilename(it.id, m.ext, m.tags);
+            persistSoon();
             attempt(it, m.path);
         }
 
         function attempt (it, path) {
             if (!items.has(it.id) || it.cancelled) return;
+            if (it.owner !== TAB_ID || it.state !== 'meta') return;
             clearTimeout(it.backT);
             it.state = 'down';
             it.loaded = 0; it.total = 0;
+            it.spd = 0; it.pLoad = 0; it.pAt = Date.now(); it.nextTryAt = 0;   /* fresh telemetry */
             if (!it.started) { it.started = true; fire(it, 'onStart'); }
-            schedule();
+            persistSoon(); schedule();
             it.xhr = GM_xmlhttpRequest({
                 method: 'GET', url: path, responseType: 'blob',
                 headers: { Referer: 'https://wallhaven.cc/' },
                 timeout: 120000,
                 onprogress (r) {
-                    if (!items.has(it.id) || it.cancelled) return;
+                    if (!items.has(it.id) || it.cancelled || it.state !== 'down') return;
+                    const now = Date.now();
+                    if (now > it.pAt && r.loaded > it.pLoad) {
+                        const inst = (r.loaded - it.pLoad) / (now - it.pAt);   /* bytes/ms */
+                        it.spd = it.spd ? it.spd * 0.6 + inst * 0.4 : inst;   /* smoothed */
+                    }
+                    it.pLoad = r.loaded || 0;
+                    it.pAt = now;
                     it.loaded = r.loaded || 0;
                     if (r.total && r.total > 0) it.total = r.total;
+                    persistProgress(it);
                     schedule();
                 },
                 onload (r) {
-                    if (!items.has(it.id) || it.cancelled) return;
+                    if (!items.has(it.id) || it.cancelled || it.state !== 'down') return;
                     it.xhr = null;
                     if (r.status === 200 && r.response) { save(it, path, r.response); return; }
                     failed(it, path, Object.assign(new Error('HTTP ' + r.status), { status: r.status }));
                 },
-                onerror ()   { if (!items.has(it.id) || it.cancelled) return; it.xhr = null; failed(it, path, new Error('network error')); },
-                ontimeout () { if (!items.has(it.id) || it.cancelled) return; it.xhr = null; failed(it, path, new Error('timeout')); },
+                onerror ()   { if (!items.has(it.id) || it.cancelled || it.state !== 'down') return; it.xhr = null; failed(it, path, new Error('network error')); },
+                ontimeout () { if (!items.has(it.id) || it.cancelled || it.state !== 'down') return; it.xhr = null; failed(it, path, new Error('timeout')); },
             });
         }
 
         function save (it, path, blob) {
+            if (!items.has(it.id) || it.cancelled || it.state !== 'down') return;
             let url = '';
-            try { url = URL.createObjectURL(blob); } catch (e) { failedFinal(it, path); return; }
+            try { url = URL.createObjectURL(blob); } catch (e) { failedFinal(it, path, 'browser storage refused the file', true); return; }
             it.blobUrl = url;
             const name = it.name || ('wallhaven-' + it.id);
             const armRevoke = (ms) => {
@@ -1802,18 +2565,18 @@
                 it.revT = setTimeout(() => {
                     it.blobUrl = '';
                     try { URL.revokeObjectURL(url); } catch {}
-                }, ms || REVOKE_MS);
+                }, ms || DTC.REVOKE_MS);
             };
             try {
                 it.gdl = GM_download({
                     url: url,
                     name: name,
-                    onload: () => { it.gdl = null; armRevoke(5000); finish(it, 'done'); },
+                    onload: () => { it.gdl = null; armRevoke(DTC.GDL_REVOKE_MS); finish(it, 'done'); },
                     onerror: (err) => {
                         it.gdl = null;
                         if (!items.has(it.id) || it.cancelled) return;
                         const msg = String((err && (err.error || err.message)) || '').toLowerCase();
-                        if (/cancel|abort/.test(msg)) { armRevoke(1000); removeItem(it.id); schedule(); return; }
+                        if (/cancel|abort/.test(msg)) { armRevoke(1000); dismiss(it.id); return; }
                         anchorSave(it, path, url, name, armRevoke);
                     },
                 });
@@ -1821,7 +2584,7 @@
         }
 
         function anchorSave (it, path, url, name, armRevoke) {
-            if (!items.has(it.id) || it.cancelled) return;
+            if (!items.has(it.id) || it.cancelled || it.state !== 'down') return;
             try {
                 const a = document.createElement('a');
                 a.href = url;
@@ -1831,75 +2594,306 @@
                 document.body.appendChild(a);
                 a.click();
                 setTimeout(() => { if (a.isConnected) a.remove(); }, 0);
-                armRevoke(REVOKE_MS);
+                armRevoke(DTC.REVOKE_MS);
                 finish(it, 'done');
-            } catch (e) { failedFinal(it, path); }
+            } catch (e) { failedFinal(it, path, 'could not open the save dialog', true); }
         }
 
         function failed (it, path, err) {
             if (!items.has(it.id) || it.cancelled) return;
+            if (it.state !== 'down' && it.state !== 'meta') return;
             const code = (err && err.status) || 0;
+            it.err = (err && err.message) ? String(err.message) : 'download failed';
             const permanent = code === 401 || code === 403 || code === 404;
-            if (permanent || it.tries >= MAX_TRIES - 1) { failedFinal(it, path); return; }
+            if (permanent || it.tries >= DTC.MAX_TRIES - 1) { failedFinal(it, path, it.err, false); return; }
             it.tries++;
             it.state = 'retry';
+            dropSlot(it);                       /* backoff must not hold a slot */
+            persistNow();                       /* durable state transition */
             schedule();
+            const delay = DTC.BACKOFF[Math.min(it.tries - 1, DTC.BACKOFF.length - 1)];
+            it.nextTryAt = Date.now() + delay;   /* row telemetry: "retry 2/4 · in 3s" */
             clearTimeout(it.backT);
             it.backT = setTimeout(() => {
+                it.backT = 0; it.nextTryAt = 0;
                 if (!items.has(it.id) || it.cancelled) return;
-                attempt(it, path);
-            }, BACKOFF[Math.min(it.tries - 1, BACKOFF.length - 1)]);
+                it.state = 'queued';            /* FIFO takes it from here */
+                persistSoon(); pump();
+            }, delay);
         }
 
-        function failedFinal (it, path) {
+        function failedFinal (it, path, why, savePipeline) {
             if (it.blobUrl) {
                 const u = it.blobUrl; it.blobUrl = '';
                 clearTimeout(it.revT);
                 try { URL.revokeObjectURL(u); } catch {}
             }
+            it.err = why || it.err || 'download failed';
             finish(it, 'fail');
-            if (path) window.open(path, '_blank');
+            /* The direct-URL courtesy is reserved for a broken SAVE step —
+             * network/HTTP failures have Retry; opening tabs for those
+             * would just spam the browser. */
+            if (savePipeline && path) { try { window.open(path, '_blank'); } catch {} }
         }
 
         function finish (it, state) {
             it.state = state;
             it.xhr = null; it.gdl = null;
             clearTimeout(it.backT);
-            if (state === 'fail') fire(it, 'onFail');
-            schedule();
-            setTimeout(() => removeItem(it.id), state === 'done' ? 500 : 1600);
-        }
-
-        function removeItem (id) {
-            const it = items.get(id);
-            if (!it) return;
-            if (it.xhr) { try { it.xhr.abort && it.xhr.abort(); } catch {} }
-            if (it.gdl) { try { it.gdl.abort && it.gdl.abort(); } catch {} }
-            clearTimeout(it.backT);
-            items.delete(id);
-            const r = rows.get(id);
-            if (r) { r.row.remove(); rows.delete(id); }
-            if (!items.size) collapse();
-            schedule();
-        }
-
-        function cancel (id) {
-            const it = items.get(id);
-            if (!it) return;
-            it.cancelled = true;
-            if (it.xhr) { try { it.xhr.abort && it.xhr.abort(); } catch {} }
-            if (it.gdl) { try { it.gdl.abort && it.gdl.abort(); } catch {} }
-            clearTimeout(it.backT);
-            if (it.blobUrl) {
-                const u = it.blobUrl; it.blobUrl = '';
-                clearTimeout(it.revT);
-                try { URL.revokeObjectURL(u); } catch {}
+            dropSlot(it);
+            it.owner = ''; it.ownerAt = 0;
+            it.nextTryAt = 0;
+            if (state === 'done') {
+                it.doneAt = Date.now(); armDoneFade(it);
+                cfg.files++; cfg.bytes += (it.total || 0);      /* lifetime stats */
+                cfgWrite();
+                drainDone++;
             }
-            removeItem(id);
-            schedule();
+            else { it.doneAt = 0; drainFail++; fire(it, 'onFail'); }
+            persistNow();
+            refreshSettingsUI();
+            schedule(); pump();
         }
 
-        return { add: add, cancel: cancel };
+        /* ─── public operations ───────────────────────────────────── */
+
+        function add (id, cbs) {
+            /* any download click is intent — a paused queue resumes.
+             * (Dedupe / failed re-add paths below share this rule.) */
+            if (cfg.paused) {
+                cfg.paused = false; cfgWrite(); refreshSettingsUI();
+            }
+            const cur = items.get(id);
+            if (cur && cur.state !== 'fail') {
+                if (cbs) {
+                    if (cur.started && cbs.onStart) { try { cbs.onStart(); } catch {} }
+                    else cur.cbs = Object.assign({}, cur.cbs, cbs);
+                }
+                persistSoon(); schedule();
+                return;
+            }
+            if (cur) {                          /* re-adding a failed item = Retry */
+                cur.cbs = cbs ? Object.assign({}, cur.cbs, cbs) : cur.cbs;
+                retry(id);
+                return;
+            }
+            const it = { id: id, cbs: cbs || null, state: 'queued', tries: 0, started: false,
+                         name: '', thumb: deriveThumb(id), loaded: 0, total: 0,
+                         xhr: null, gdl: null, backT: 0, revT: 0, fadeT: 0, blobUrl: '',
+                         cancelled: false, claimPend: false, slot: false, uiGone: false,
+                         spd: 0, pLoad: 0, pAt: 0, nextTryAt: 0,
+                         seq: ++seq, addedAt: Date.now(), err: '', doneAt: 0,
+                         owner: TAB_ID, ownerAt: Date.now(), revAt: 0 };
+            items.set(id, it);
+            gone.delete(id);                     /* a fresh add clears any tombstone */
+            if (!root) build();
+            root.classList.add('on');
+            persistNow();                        /* durable append, in order, before any await */
+            pump(); schedule();
+        }
+
+        function retry (id) {
+            const it = items.get(id);
+            if (!it || it.state !== 'fail') return;
+            it.tries = 0; it.err = ''; it.cancelled = false; it.started = false;
+            it.loaded = 0; it.total = 0; it.uiGone = false; it.nextTryAt = 0;
+            it.state = 'queued';
+            it.owner = TAB_ID; it.ownerAt = Date.now(); it.claimPend = true;
+            gone.delete(id);
+            if (!claimT) claimT = setTimeout(verifyClaims, DTC.CLAIM_MS);
+            persistNow();
+            schedule(); pump();
+        }
+
+        function retryAll () {
+            let n = 0;
+            for (const it of [...items.values()]) {
+                if (it.state === 'fail') { retry(it.id); n++; }
+            }
+            return n;
+        }
+        function clearFailed () {
+            let n = 0;
+            for (const it of [...items.values()]) {
+                if (it.state === 'fail') { dismiss(it.id); n++; }
+            }
+            schedule();
+            return n;
+        }
+
+        function hardKill (it) {
+            /* full teardown for a consciously removed item — aborts the
+             * transfer, revokes the blob, clears timers, frees the slot.
+             * Used by dismiss (single X), clearAll, and mergeEnv when a
+             * tombstone arrives — so a removal is honored even by the
+             * tab that is mid-transfer on that very item. */
+            it.cancelled = true;
+            if (it.blobUrl) { const u = it.blobUrl; it.blobUrl = ''; clearTimeout(it.revT); try { URL.revokeObjectURL(u); } catch {} }
+            killItem(it.id);
+        }
+        function dismiss (id) {
+            const it = items.get(id);
+            if (it) hardKill(it);
+            gone.set(id, Date.now());           /* tombstone: authoritative everywhere */
+            persistNow(); schedule(); pump();
+        }
+        function cancel (id) { dismiss(id); }
+        function clearAll () {
+            /* remove EVERYTHING — rows, store, executing transfers in
+             * every tab (tombstones ride the shared store). Lifetime
+             * stats and the settings survive; the queue restarts
+             * empty. */
+            let n = 0;
+            for (const it of [...items.values()]) { hardKill(it); gone.set(it.id, Date.now()); n++; }
+            prevWork = 0; drainDone = 0; drainFail = 0; notified = false;   /* no bogus drain notice */
+            prune();                            /* progress-bookkeeping maps */
+            persistNow(); schedule();
+            return n;
+        }
+
+        /* ─── cross-tab reconciliation ────────────────────────────── */
+
+        function mergeOne (o, revAt) {
+            const it = items.get(o.id);
+            if (!it) { adoptItem(o, revAt); return true; }
+            if (it.slot || it.claimPend) return false;       /* executing locally — mine wins */
+            let changed = false;
+            const set = (k, v) => { if (it[k] !== v) { it[k] = v; changed = true; } };
+            const was = it.state;
+            set('state', o.state); set('name', o.name || '');
+            set('thumb', o.thumb || it.thumb);
+            set('loaded', o.loaded || 0); set('total', o.total || 0);
+            set('tries', o.tries || 0); set('err', o.err || '');
+            set('doneAt', o.doneAt || 0);
+            set('owner', o.owner || ''); set('ownerAt', o.ownerAt || 0);
+            set('seq', o.seq || it.seq);
+            it.revAt = revAt || it.revAt;
+            if (it.state === 'done' && was !== 'done') armDoneFade(it);
+            if (it.state !== 'done' && it.fadeT) { clearTimeout(it.fadeT); it.fadeT = 0; }
+            if (it.state === 'fail' && it.uiGone) it.uiGone = false;
+            return changed;
+        }
+
+        function mergeEnv (env) {
+            let changed = false;
+            if (env.gone && typeof env.gone === 'object') {
+                for (const [id, ts] of Object.entries(env.gone)) {
+                    if (typeof ts !== 'number') continue;
+                    if (!gone.has(id)) { gone.set(id, ts); changed = true; }
+                    if (items.has(id)) { hardKill(items.get(id)); changed = true; }   /* full teardown — even mid-transfer (blob revoke too) */
+                }
+            }
+            const byId = new Map();
+            for (const o of env.items) if (validItem(o)) byId.set(o.id, o);
+            for (const it of [...items.values()]) {
+                if (gone.has(it.id)) { hardKill(it); changed = true; continue; }   /* a conscious removal beats ANY local state — even mid-transfer */
+                if (it.slot || it.claimPend) continue;       /* executing locally — mine wins */
+                const ext = byId.get(it.id);
+                if (ext) { if (mergeOne(ext, env.rev || 0)) changed = true; continue; }
+                if ((env.base || 0) >= it.revAt) { killItem(it.id); changed = true; }
+                /* else: the writer never saw this item (stale write) — keep;
+                 * my next persist reasserts it. */
+            }
+            let added = false;
+            for (const o of byId.values()) {
+                if (items.has(o.id) || gone.has(o.id)) continue;
+                if (o.state === 'done' && Date.now() - (o.doneAt || 0) > DTC.DONE_TTL) continue;
+                adoptItem(o, env.rev || 0); added = true;
+            }
+            for (const o of byId.values()) if (o.seq > seq) seq = o.seq;
+            if (added) { resort(); changed = true; }
+            return changed;
+        }
+
+        function onRemote () {
+            const env = qRead();
+            if (!env) return;
+            const changed = mergeEnv(env);
+            if (prune()) changed = true;
+            if (changed) persistSoon();          /* converge the store; no echo when nothing changed */
+            schedule(); pump();
+        }
+
+        function watchdog () {
+            const env = qRead();
+            if (!env) { if (prune()) persistNow(); return; }
+            const changed = mergeEnv(env);
+            const tabs = readTabs();
+            const died = diedRead();
+            const now = Date.now();
+            let touched = false;
+            for (const o of env.items) {
+                if (o.state !== 'meta' && o.state !== 'down' && o.state !== 'retry' &&
+                    !(o.state === 'queued' && o.owner)) continue;   /* owned-queued = mid-claim */
+                if (o.owner === TAB_ID) continue;
+                if (ownerDead(o.owner, tabs, died)) {
+                    const it = items.get(o.id) || adoptItem(o, env.rev || 0);
+                    it.state = 'queued'; it.owner = ''; it.ownerAt = 0;
+                    it.loaded = 0; it.total = 0; it.claimPend = false;
+                    touched = true;
+                }
+            }
+            /* unsticker: a claim whose verify timer was lost (context
+             * freeze, timer drop) must not park an item forever */
+            for (const it of items.values()) {
+                if (it.claimPend && !claimT && now - it.ownerAt > 4 * DTC.CLAIM_MS) {
+                    it.claimPend = false; touched = true;
+                }
+            }
+            if (prune()) touched = true;
+            if (changed || touched) { persistNow(); resort(); pump(); }
+        }
+
+        function boot () {
+            if (booted) return;
+            booted = true;
+            touchTabs();
+            if (items.size) {
+                if (!root) build();
+                root.classList.add('on');
+                schedule(); pump();               /* resume pending work */
+            }
+            hbT = setInterval(() => { if (iOwn()) touchTabs(); }, DTC.HEARTBEAT);
+            wdT = setInterval(watchdog, DTC.WATCHDOG);
+            watchdog();
+        }
+
+        /* ─── wiring + hydration at eval ──────────────────────────── */
+
+        if (typeof GM_addValueChangeListener === 'function') {
+            try { GM_addValueChangeListener(DTC.K_Q, () => onRemote()); } catch {}
+            try { GM_addValueChangeListener(DTC.K_CFG, () => onCfgRemote()); } catch {}
+        }
+        window.addEventListener('pagehide', () => {
+            /* Unload my in-flight items as claimable work — a refresh or a
+             * tab close must never strand a download. (Crashes without
+             * pagehide are covered by the watchdog's staleness window.) */
+            let touched = false;
+            for (const it of items.values()) {
+                if (it.owner === TAB_ID && liveState(it.state)) {
+                    it.state = 'queued'; it.owner = ''; it.ownerAt = 0;
+                    it.loaded = 0; it.total = 0;
+                    clearTimeout(it.backT);
+                    dropSlot(it);
+                    touched = true;
+                }
+            }
+            if (touched || dirty) persistNow();
+            /* GM storage may drop this dying write (async bridge), so the
+             * death also goes to localStorage — synchronous, commits during
+             * unload — and every successor can prove me dead instantly. */
+            noteDeath(TAB_ID);
+        });
+        window.addEventListener('pageshow', () => {     /* bfcache restore / fresh load */
+            clearDeath(TAB_ID);                          /* I'm alive — un-note my death */
+            touchTabs();
+            pump();
+        });
+
+        hydrate();
+
+        return { add: add, cancel: cancel, boot: boot, retryAll: retryAll, clearFailed: clearFailed,
+                 clearAll: clearAll, cfg: setCfg, onCfg: onCfg, TAB_ID: TAB_ID };
     })();
 
     function mkFilename (id, ext, tags) {
@@ -3497,6 +4491,18 @@
       '<div class="nx-grid">' +
         '<label class="nx-field nx-f-q"><span class="nx-l">API key · <a class="nx-a" href="https://wallhaven.cc/settings/account" target="_blank" rel="noopener">get one</a></span><input id="nx-key" class="nx-in" type="password" autocomplete="off" spellcheck="false" placeholder="optional — higher limits, NSFW"></label>' +
       '</div>' +
+      '<div class="nx-sec-h">Downloads</div>' +
+      '<div class="nx-grid nx-dlrow">' +
+        '<div class="nx-field"><span class="nx-l">Parallel downloads</span>' +
+          '<div class="nx-dlstep">' +
+            '<button type="button" class="nx-stp" id="nx-dlm" aria-label="Fewer parallel downloads">−</button>' +
+            '<span class="nx-dlcv" id="nx-dlcv">1</span>' +
+            '<button type="button" class="nx-stp" id="nx-dlp" aria-label="More parallel downloads">+</button>' +
+          '</div></div>' +
+        '<div class="nx-field"><span class="nx-l">Notify when finished</span>' +
+          '<span class="nx-dlchk"><input type="checkbox" id="nx-dlnotif"><span>desktop alert when the queue drains</span></span></div>' +
+      '</div>' +
+      '<div class="nx-dlstats" id="nx-dlstats"></div>' +
       '<div class="nx-actrow">' +
         '<button type="button" class="nx-btn nx-btn-go" id="nx-go"></button>' +
         '<button type="button" class="nx-btn" id="nx-stop2" disabled>Stop</button>' +
@@ -3507,7 +4513,7 @@
       '<div class="nx-sec-h">Search history <span class="nx-hspan">· keep <input id="nx-hm" class="nx-in nx-in-hm" type="number" min="1" step="1"> searches</span></div>' +
       '<div class="nx-hist" id="nx-hist"></div>' +
       '<div class="nx-hist-foot"><button type="button" class="nx-btn nx-btn-dim" id="nx-hist-clear">Clear history</button></div>' +
-      '<div class="nx-foot"><span>naXim Labs · Wallhaven Enhancer v7.1.3</span><a href="https://github.com/0naXim0" target="_blank" rel="noopener">github.com/0naXim0</a></div>' +
+      '<div class="nx-foot"><span>naXim Labs · Wallhaven Enhancer v7.5.1</span><a href="https://github.com/0naXim0" target="_blank" rel="noopener">github.com/0naXim0</a></div>' +
     '</div></div></div>';
 
     function chipsVal (box)   { return Array.prototype.map.call(box.children, c => c.classList.contains('on') ? '1' : '0').join(''); }
@@ -3727,6 +4733,26 @@
             markFavRange();
         });
 
+        /* Downloads — the DL engine's settings live HERE (top panel).
+           The queue pane itself is action-only: pause/resume, retry,
+           clear-failed, clear-all. Repaints on every change, local or
+           from a sibling tab, through DL.onCfg. */
+        const dlMinus = $r('#nx-dlm'), dlPlus = $r('#nx-dlp'), dlCv = $r('#nx-dlcv'),
+              dlNotif = $r('#nx-dlnotif'), dlStats = $r('#nx-dlstats');
+        function paintDl () {
+            const c = DL.cfg();
+            dlCv.textContent = String(c.conc);
+            dlMinus.disabled = c.conc <= 1;
+            dlPlus.disabled = c.conc >= c.max;
+            if (dlNotif.checked !== !!c.notif) dlNotif.checked = !!c.notif;
+            if (dlStats.textContent !== c.statsText) dlStats.textContent = c.statsText;
+        }
+        dlMinus.addEventListener('click', () => DL.cfg({ conc: DL.cfg().conc - 1 }));
+        dlPlus.addEventListener('click', () => DL.cfg({ conc: DL.cfg().conc + 1 }));
+        dlNotif.addEventListener('change', () => DL.cfg({ notif: dlNotif.checked }));
+        DL.onCfg(paintDl);
+        paintDl();
+
         $r('.nx-presets').addEventListener('click', e => {
             const b = e.target.closest('button[data-p]'); if (b) applyPreset(b.dataset.p);
         });
@@ -3874,6 +4900,21 @@
 .nx-hspan { display:inline-flex; align-items:center; gap:6px; text-transform:none;
     letter-spacing:0; font-weight:500; font-size:11px; }
 .nx-in-hm { height:22px; width:52px; font-size:11px; }
+.nx-dlrow { align-items:flex-end; }
+.nx-dlstep { display:flex; align-items:center; gap:5px; }
+.nx-stp { width:30px; height:30px; display:flex; align-items:center; justify-content:center;
+    border-radius:9px; border:1px solid var(--bd); background:var(--bg); color:var(--mut);
+    font:700 14px/1 -apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+    transition:color .15s, border-color .15s; }
+.nx-stp:hover:not(:disabled) { color:var(--nx-acc); border-color:var(--nx-acc); }
+.nx-stp:disabled { opacity:.3; cursor:default; }
+.nx-dlcv { min-width:56px; height:30px; text-align:center; border:1px solid var(--bd);
+    border-radius:9px; background:var(--bg); color:var(--nx-acc);
+    font:700 12.5px/28px -apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif; }
+.nx-dlchk { display:flex; align-items:center; gap:8px; height:30px; cursor:pointer; }
+.nx-dlchk input { width:15px; height:15px; accent-color:#7aa2f7; cursor:pointer; }
+.nx-dlchk span { font-size:11.5px; color:var(--mut); }
+.nx-dlstats { padding:0 0 6px; font-size:10.5px; color:var(--mut); }
 .nx-hist-foot { display:flex; justify-content:flex-end; padding-top:4px; }
 .nx-foot { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:6px;
     padding:8px 0 2px; margin-top:8px; border-top:1px solid var(--bd);
@@ -4091,12 +5132,35 @@ figure.thumb.nx-flash { animation:nx-flash .55s ease; }
 .nx-dlm-ring .nx-r-fg.nx-indet { opacity:.45; }
 .nx-dlm-count { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
     font:700 9.5px/1 -apple-system,"Segoe UI",sans-serif; color:#e8ecf4; pointer-events:none; }
-.nx-dlm-list { display:none; flex-direction:column; gap:3px; width:262px; max-height:242px; overflow-y:auto;
+.nx-dlm-list { display:none; flex-direction:column; width:262px;
     padding:6px; border-radius:12px; border:1px solid #2a2f3a; background:rgba(25,28,35,.96);
     backdrop-filter:blur(10px); box-shadow:0 10px 32px rgba(0,0,0,.45); }
 .nx-dlm.nx-open .nx-dlm-list { display:flex; animation:nx-dlm-in .16s ease; }
 @keyframes nx-dlm-in { from { opacity:0; transform:translateY(6px); } }
+.nx-dlm-bar { display:flex; align-items:center; gap:2px; padding:0 2px 6px; margin-bottom:4px;
+    border-bottom:1px solid rgba(255,255,255,.07); }
+.nx-dlm-info { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:0 5px;
+    font:600 9.5px/1.2 -apple-system,"Segoe UI",sans-serif; color:#98a0b0; }
+.nx-dlm-act { width:22px; height:22px; flex:none; display:flex; align-items:center; justify-content:center;
+    border-radius:6px; color:#8d93a3; transition:color .15s, background .15s; }
+.nx-dlm-act svg { width:12px; height:12px; }
+.nx-dlm-act:hover { color:#c9d2e2; background:rgba(255,255,255,.06); }
+.nx-dlm-act[hidden] { display:none; }
+.nx-dlm-act.nx-pause:hover { color:#e0af68; background:rgba(224,175,104,.12); }
+.nx-dlm-act.nx-rta:hover { color:var(--nx-ok); background:rgba(158,206,106,.12); }
+.nx-dlm-act.nx-clr:hover { color:var(--nx-err); background:rgba(247,118,142,.12); }
+.nx-dlm-act.nx-trash:hover { color:#f7768e; background:rgba(247,118,142,.12); }
+.nx-dlm-act.nx-trash.nx-armed { color:#f7768e; background:rgba(247,118,142,.2); }
+.nx-dlm-act:disabled { opacity:.3; cursor:default; }
+.nx-dlm-act:disabled:hover { color:#8d93a3; background:transparent; }
+.nx-dlm.nx-paused .nx-dlm-ring .nx-r-fg { stroke:#e0af68; }
+.nx-dlm-rows { display:flex; flex-direction:column; gap:3px; overflow-y:auto; max-height:216px; }
 .nx-dlm-row { display:flex; align-items:center; gap:8px; padding:4px 6px; border-radius:8px; }
+.nx-dlm-col { flex:1; min-width:0; display:flex; flex-direction:column; gap:2px; }
+.nx-dlm-sub { overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    font:500 9px/1.1 -apple-system,"Segoe UI",sans-serif; color:#79808f; }
+.nx-dlm-row[data-st=down] .nx-dlm-sub { color:#8d93a3; }
+.nx-dlm-row[data-st=fail] .nx-dlm-sub { color:var(--nx-err); opacity:.85; }
 .nx-dlm-row:hover { background:rgba(255,255,255,.04); }
 .nx-dlm-thumb { width:34px; height:22px; object-fit:cover; border-radius:4px; background:#101216; flex:none; }
 .nx-dlm-id { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
@@ -4117,9 +5181,11 @@ figure.thumb.nx-flash { animation:nx-flash .55s ease; }
     border-radius:6px; color:#8d93a3; cursor:pointer; transition:color .15s, background .15s; }
 .nx-dlm-x:hover { color:#f7768e; background:rgba(247,118,142,.12); }
 .nx-dlm-x svg { width:11px; height:11px; }
+.nx-dlm-rt:hover { color:var(--nx-ok); background:rgba(158,206,106,.12); }
 @media (max-width:760px) {
     .nx-dlm { right:10px; bottom:10px; }
-    .nx-dlm-list { width:220px; max-height:200px; }
+    .nx-dlm-list { width:220px; }
+    .nx-dlm-rows { max-height:170px; }
 }
 
 .nx-cont-bar { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin:12px 0;
@@ -4245,6 +5311,7 @@ figure.thumb.nx-flash { animation:nx-flash .55s ease; }
     .nx-fav::after, .nx-fav svg { transition:none !important; animation:none !important; }
     .nx-dlm { transition:none !important; }
     .nx-dlm-ring .nx-r-fg, .nx-dlm-rring .nx-r-fg { transition:none !important; }
+    .nx-dlm-act, .nx-stp { transition:none !important; }
     .nx-dlm.nx-open .nx-dlm-list { animation:none !important; }
 }
 #nx-fav-notice{position:fixed;right:22px;bottom:22px;z-index:2147483647;max-width:360px;padding:12px 16px;border:1px solid rgba(255,255,255,.16);border-radius:12px;background:rgba(18,22,30,.97);box-shadow:0 12px 34px rgba(0,0,0,.42);color:#eef3fb;font:600 13px/1.35 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;opacity:0;transform:translateY(10px);pointer-events:none;transition:opacity .18s,transform .18s}#nx-fav-notice.show{opacity:1;transform:none}#nx-fav-notice[data-kind="ok"]{border-color:rgba(125,220,160,.5)}#nx-fav-notice[data-kind="error"]{border-color:rgba(244,120,140,.6)}
@@ -4317,6 +5384,7 @@ figure.thumb.nx-flash { animation:nx-flash .55s ease; }
      * render native cards, and the cached index is validated lazily
      * (first scan card, picker open, or a removal that needs it). */
     step('favIndex', () => { if (FavState.hasCache()) FavState.ensureIndexSoon(5000); });
+    step('dlQueue',  () => { DL.boot(); });
     step('status',   () => setStatus('Ready · hover a card, then click the eye for an instant preview'));
     console.info('[naXim Labs] initialized');
 })();
