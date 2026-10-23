@@ -1,6 +1,6 @@
 # Wallhaven Enhancer
 
-A focused Tampermonkey userscript by **naXim Labs** (v7.5.1) that makes Wallhaven galleries faster to explore. It adds instant full-resolution previews, wallpaper metadata, direct original-file downloads, and keyboard browsing without replacing Wallhaven’s native pages.
+The final stable Tampermonkey userscript by **naXim Labs** (v8.1.0) that makes Wallhaven galleries faster to explore. It adds instant full-resolution previews, wallpaper metadata, direct original-file downloads, batch wallpaper and batch page downloads, and keyboard browsing without replacing Wallhaven’s native pages.
 
 ## Features
 
@@ -13,7 +13,9 @@ A focused Tampermonkey userscript by **naXim Labs** (v7.5.1) that makes Wallhave
 - Show resolution, category, and favorite-count metadata.
 - Detect cards added dynamically after filtering or pagination.
 - Keep requests rate-conscious with an in-memory metadata cache.
-- AND MUCH MORE !!!
+- Download multiple wallpapers from the current results in one batch.
+- Download multiple Wallhaven pages through the built-in batch controls.
+- Use the integrated search panel to search and work with results without leaving Wallhaven.
 
 ## Installation with Tampermonkey
 
@@ -53,7 +55,7 @@ The same CDN URL is embedded in the script’s `@downloadURL` and `@updateURL` m
 
 ## Releases
 
-The current stable v7.5.1 package and direct `.user.js` download are published in the repository’s [Releases](https://github.com/0naXim0/wallhaven-enhancer/releases) tab. The source userscript is also kept at the repository root so it is easy to inspect, fork, and update.
+The final stable v8.1.0 package and direct `.user.js` download are published in the repository’s [Releases](https://github.com/0naXim0/wallhaven-enhancer/releases) tab. The source userscript is also kept at the repository root so it is easy to inspect and fork. This release is considered feature-complete and final.
 
 ## Permissions and privacy
 

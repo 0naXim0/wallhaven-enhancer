@@ -6,8 +6,8 @@
 // @downloadURL  https://cdn.jsdelivr.net/gh/0naXim0/wallhaven-enhancer@main/wallhaven-enhancer.user.js
 // @updateURL    https://cdn.jsdelivr.net/gh/0naXim0/wallhaven-enhancer@main/wallhaven-enhancer.user.js
 // @supportURL   https://github.com/0naXim0
-// @version      7.5.1
-// @description  Byte-accurate downloads, instant previews, persistent HD Mode, smooth zoom & pan, unified cards, adaptive scanning, a server-verified favorite/collection system with true add/remove semantics, a per-collection Quick-Save target and a hold-to-open collection picker, and a crash-proof persistent download queue with cross-tab sync, retry, tunable parallelism, pause/resume and speed/ETA telemetry. A naXim Labs product.
+// @version      8.1.0
+// @description  Byte-accurate downloads, instant previews, persistent HD Mode that zooms in true full resolution with an honest progress bar that never stalls (download, render and retry are always distinct states, with live MB counts and a watchdog that never lets a transfer or a decode hang), tags on the very first open, a 1:1 native-pixel zoom, smooth zoom & pan, unified cards, adaptive scanning, a floating one-tap pill that queues every wallpaper you have scrolled to load into the classic download manager — its number always equals exactly what one tap will queue, page range included; on scan grids the same pill queues every batch from batch 1 to the batch on screen, live partial included — plus a download button beside every page number (search, latest, hot, toplist, uploads, favorites, collections and every scan batch page) that queues that page only, a server-verified favorite/collection system with true add/remove semantics, a per-collection Quick-Save target and a hold-to-open collection picker, and a crash-proof persistent download queue with cross-tab sync, retry, tunable parallelism, pause/resume and speed/ETA telemetry — plus the v7.9.1 scan engine exactly as it was: favorites searches inside a date window are collected as a ranked window (upload order, one exact pass) and served top-♥-first per batch; only the pages each batch needs are ever fetched, with persistent job ledgers, crash-safe checkpoints and one-click resume; every batch saves as its own sub-history page inside the session's card, served as a separate grid page — Continue starts the next batch inside the same session and never repeats a wallpaper, and the pill's Back and Forward buttons walk the saved batch pages in both directions; the Continue pill floats on screen — always one tap away, never a scroll; every new batch opens at the very top of the page while an interrupted batch resumes exactly where you left it; the scan progress bar always resolves (every terminal path fills, fades and clears it); and big scans are rate-limit-proof: every request the script makes flows through one rolling rate gate that stays under Wallhaven's limit, honors the server's Retry-After, and waits out any 403/429 with an escalating backoff instead of erroring. A naXim Labs product.
 // @match        https://wallhaven.cc/*
 // @run-at       document-end
 // @noframes
@@ -26,6 +26,439 @@
 
 // ════════════════════════════════════════════════════════════════
 // ════════════════════════════════════════════════════════════════
+//  v8.1.0 — THE v7.9.1 SCANNER, KEPT — and the upgrades that were
+//            never about the query, ported onto it.
+//
+//    • THE BASE IS v7.9.1, VERBATIM — its scan engine (the
+//      binary-search date bounds, the ranked-window collection, the
+//      walk-vs-rank strategy sampling, the per-batch pages with
+//      served-id ledgers, the query as a plain q parameter) is the
+//      engine this build ships, untouched. Nothing from the later
+//      experimental lines is here: no Fav/day fields, no Fav/day
+//      sort, no query redesign, no turbo pipeline — exactly as
+//      requested.
+//
+//    • BACK & FORWARD IN BATCH — the Continue pill gains two quiet
+//      arrow buttons: Back reopens the previous batch's page, Forward
+//      the next saved one — payloads straight from the ledger, the
+//      live session's cursor never touched, never offered mid-scan.
+//      From the newest saved batch, Forward hands the future back to
+//      Continue; the LIVE in-progress batch is a page too (its
+//      crash-safe partial, written at every checkpoint, is its
+//      payload). Every button names the exact batch it opens.
+//
+//    • THE PILL LEARNS BATCHES — on a scan grid the floating pill
+//      queues EVERY batch from batch 1 to the batch on screen:
+//      reach batch 2 and it reads "batches 1–2" and queues both,
+//      exactly the way it queues "pages 1–4" on the listing; the live
+//      partial is included while it serves. The per-batch chip beside
+//      "Batch N" still queues that batch only, so single-batch and
+//      whole-range downloads live side by side — pages and batches,
+//      one design.
+//
+//    • THE HD BAR, HONEST — the green HD progress bar could sit at
+//      100% forever, progress could read wrong on fast links, and HD
+//      Mode could silently stop converting after a few quick
+//      navigations. Every root cause, fixed at the root:
+//      (1) THE POOL LEAK — the blob pool never marked a running
+//      transfer as started, so cancelling it in name only never
+//      aborted the transfer and never freed its slot; three leaks
+//      and the pool was dead until refresh — HD stopped converting.
+//      A running job now reports itself: cancel aborts the transfer
+//      and frees the slot, always.
+//      (2) THE BAR — it never reads 100% while bytes still flow
+//      (99.2% cap — a full bar that does nothing is the oldest lie
+//      in progress UIs), narrates live MB counts, handles unknown
+//      totals with the indeterminate shimmer instead of freezing,
+//      and switches to a distinct green "Rendering" shimmer the
+//      moment the blob lands: download, render and done are three
+//      visibly different states.
+//      (3) THE HANGS — a stall watchdog aborts transfers that stop
+//      moving for 12 s (or hold every byte for 5 s without
+//      finalizing) and feeds them to the retry ladder instead of
+//      hanging for the full 45 s timeout; the decode is raced
+//      against a hard 8 s bound so an exotic codec can never wedge
+//      the pipeline; a second-chance decode checks img.complete
+//      first (an already-settled image resolves instantly instead
+//      of burning the timeout); and the blob is pinned for the
+//      whole decode, so a cache eviction can no longer revoke its
+//      URL mid-decode and kill the conversion. An aborted attempt
+//      re-arms through the retry ladder instead of dying silently.
+//
+//    • THE SCAN BAR, ALWAYS RESOLVED — a job that completed entirely
+//      inside its first batch (a ranked window whose whole pool fit
+//      in batch 1) left the thin scan progress bar frozen mid-way:
+//      the "batch filled" path resolved it, but the exhausted /
+//      paused / error / empty-window / no-results paths never did.
+//      Every terminal path now fills, fades and clears the bar, and
+//      a catch-all after every scan entry point guarantees no future
+//      path can regress it.
+//
+//    • ALSO — the per-batch chip follows the visible bar when a
+//      scan-mode section hides its native header (a /search?page=2+
+//      URL), so "Batch N" always carries its single-batch button.
+//
+//  v7.9.1 — TRUE-PIXEL HD ZOOM & TAGS ON THE FIRST OPEN:
+//
+//    • THE 8K BUG — HD Mode always downloaded the full file, but
+//      the preview <img> was laid out at screen-fit size, so the
+//      browser clamped its decode to that small box and zooming
+//      only blew up a low-resolution raster — an 8K wallpaper
+//      never looked 8K in the lightbox, while the downloaded file
+//      was perfect in any OS viewer. The HD layer is now laid out
+//      at its TRUE natural pixel size (7680 CSS px for an 8K) and
+//      scaled to fit by the transform itself: the browser keeps a
+//      full-quality decode, and every zoom level samples DOWN
+//      from native pixels, never up from a downscaled one. Same
+//      translate, same pan, same gestures — the pixels are just
+//      real now.
+//
+//    • 1:1 BUTTON — the zoom cluster gains a "1:1" jump (and the
+//      "1" key): one tap renders the active layer at exactly one
+//      image pixel per screen pixel — the honest way to inspect
+//      quality, HD or preview.
+//
+//    • TAGS, INSTANTLY — the lightbox sometimes opened without
+//      its tags and needed a second click to show them: page-sync
+//      and scans seed the metadata cache with partial records
+//      (path, date, resolution — no tags), and the first open
+//      rendered that partial record while ignoring the full
+//      record the click itself fetched. The bar now merges every
+//      arrival — cached partial first, the fresh full record the
+//      moment it lands — and re-renders its chips idempotently, so
+//      the tags are on screen at first open, always.
+//
+//    • HOVER PRIME — a 300 ms dwell over any thumbnail fires (at
+//      most) the same metadata fetch the click itself would
+//      trigger — deduped by the cache, paced by the rate shield,
+//      free for anything already fetched. By the time you click,
+//      the tags and the HD path are already local: the first open
+//      is instant, with zero extra requests for what you actually
+//      open.
+
+//  v7.9.0 — TRUE PAGE MATH & PER-PAGE BUTTONS — the pill's number
+//    finally equals what it downloads, and every page gets its own
+//    button:
+//
+//    • THE BUG — on an endless-scroll listing the pill kept saying
+//      the count from page load ("24") while a tap actually queued
+//      EVERY page loaded below it — 72 after three pages. The label
+//      lied; the download was right. Now the number is recomputed
+//      from the live DOM every time wallhaven appends a page (one
+//      rAF-coalesced childList observer on the listing — no
+//      polling, no layout reads), and the tap harvests the very
+//      same list, so the two can never disagree again.
+//
+//    • MULTI-PAGE BY DESIGN — that everything-loaded behavior is
+//      now the feature: want four pages? Scroll until four pages
+//      sit on screen — the pill reads "96 · pages 1–4" — and one
+//      tap queues all 96 through the classic manager, exactly as
+//      if you had clicked every wallpaper one by one. The tag
+//      always names the exact range.
+//
+//    • PAGE BUTTONS — every loaded page now carries its own small
+//      download chip beside its page number ("Page 4 / 9876"): one
+//      tap queues THAT page only — 24, never 72. The chip lives in
+//      wallhaven's own header on every appended page, and the
+//      page-1 section (which wallhaven leaves headerless) gets a
+//      matching bar injected so every page is equal. Search,
+//      latest, hot, toplist, uploads, favorites and collections
+//      all carry them — account favorites included.
+//
+//    • SCAN BATCH PAGES — while the panel's search grid owns the
+//      listing, the first section's bar becomes "Batch N" with the
+//      batch's live count; the stale native header steps aside
+//      (hidden, never destroyed) until Clear grid restores the
+//      listing and brings it back.
+//
+//    • Both buttons ride the EXACT classic download manager —
+//      DL.add per wallpaper, the same queue N single clicks fill:
+//      concurrency, pacing, byte-accurate transfers, names,
+//      dedupe, retry, pause/resume, cross-tab sync, telemetry.
+//      Zero requests at tap time; the unified rate shield stays
+//      untouched.
+//
+//    • Both are separately switchable in the panel's Downloads
+//      section ("Floating page button", "Page download buttons").
+//
+//  v7.8.1 — THE CLASSIC QUEUE, ONE TAP — the batch download rides
+//    the download manager you already trust, and the extra
+//    machinery goes away:
+//
+//    • PAGE PILL — a single minimalist button that floats on
+//      screen (turn it off in the panel's Downloads section).
+//      One tap queues EVERY wallpaper on the current page into
+//      the exact same download manager a single click uses —
+//      identical concurrency, pacing, byte-accurate transfers,
+//      names, dedupe, retry, pause/resume, cross-tab sync and
+//      telemetry. It is literally the same as clicking every
+//      wallpaper's download button one by one, in one click.
+//      The label always tells the truth: how many wallpapers the
+//      page holds (live with the grid — the panel's own number)
+//      and which page it is. Zero requests at tap time — all
+//      network work happens inside the queue, behind the rate
+//      shield.
+//
+//    • REMOVED, BY DESIGN — the ZIP batch system (page + all-
+//      pages + collection walkers) and the hot ♥/day ratio sort
+//      with its Min/Max/≈Target fields. The classic sort menu,
+//      the classic queue and every pre-7.8 behavior are exactly
+//      as they were.
+//
+//    • KEPT — top-of-page Continue for genuinely-new batches
+//      (interrupted resumes keep your position) and the unified
+//      rate shield (every request paced, Retry-After honored).
+//
+//  v7.8.0 — HOT RATIO SORT · BULK ZIP · TOP-OF-PAGE CONTINUE
+//
+//    • HOT — ♥ PER DAY — a third sort that ranks wallpapers by how
+//      FAST they gain favorites, not how many they have. The window
+//      is collected once in upload order, every match is scored as
+//      favorites / days-since-release (age floored at two days, so
+//      a brand-new upload can never score infinity), and each batch
+//      serves the hottest first — the 95-♥ wallpaper from last week
+//      now outranks the 100-♥ wallpaper from 2015. Min ♥/day and
+//      Max ♥/day FILTER the range; ≈ Target RANKS by closeness to an
+//      exact ratio instead of by size; every card wears its score.
+//      The Sort dropdown sorts; the chips filter — clearly separated,
+//      one compact row, only visible for the hot sort.
+//
+//    • BULK ZIP — batch downloads, done right: one tap on "Page"
+//      zips everything on screen; "All pages" walks the listing you
+//      are on — any search, latest/hot/toplist, a user's uploads,
+//      your own favorites, or another account's public collections
+//      (private ones stay private) — and zips it all. Chunked STORE
+//      ZIPs (40 files each) keep memory flat, three concurrent
+//      fetches keep the CDN happy, every wallhaven.cc request rides
+//      the rate shield, ids are deduped per job and per session,
+//      failed items retry twice then report with a one-tap Retry,
+//      and the original wallhaven-{id} names and exact bytes are
+//      preserved. Big jobs (>300) show a size estimate and ask for
+//      one confirming tap before a single byte moves.
+//
+//    • CONTINUE FROM THE TOP — starting the NEXT batch now scrolls
+//      to the very top of the fresh page, exactly when the batch
+//      begins loading; resuming an interrupted batch (pause, error,
+//      deep scan) keeps your position instead — state-based, never
+//      timing-based. Viewing a saved batch page opens at the top
+//      too, like every page should.
+//
+//    • SHARPENED — light metadata for bulk adds (a cached path
+//      answers instantly instead of one API call per wallpaper), a
+//      long-standing Continue-pill CSS typo, and honest version
+//      stamps everywhere.
+//
+//  v7.7.3 — UNIFIED RATE SHIELD — the 429 that survived v7.7.2:
+//    one gate for EVERY request, not just scan pages.
+//
+//    • THE HOLE — v7.7.2 paced the scan's page requests, but
+//      wallpaper metadata (/w/ lookups), page-sync and the HTML
+//      fallback still fired unpaced. Worse: a throttled lookup
+//      CASCADEd into up to three extra requests (keyed API, then
+//      keyless API, then an HTML scrape) — exactly while the server
+//      was already saying slow down. The shared window stayed
+//      saturated, so big scans STILL met 429s.
+//
+//    • ONE GATE — the rate gate now lives in the network layer
+//      itself. Every request the script sends to wallhaven.cc —
+//      scan pages, /w/ metadata, page-sync, the /w/ HTML fallback —
+//      passes the SAME rolling 60-second window: 36-request budget
+//      (20% headroom; 20 while any tab's cooldown is live), 250 ms
+//      spacing, waits sliced so Pause stays instant. One budget,
+//      one IP — the math can no longer lie.
+//
+//    • RETRY-AFTER IS LAW — 429/403 answers now carry the server's
+//      own wait time: the network layer publishes it as the
+//      cross-tab cooldown, and every backoff (the scan ladder and
+//      metadata retries alike) honors it instead of guessing.
+//
+//    • DEEPER LADDER, CALMER FETCHES — the scan ladder now runs
+//      2s → 64s (six rungs, past a full limit window); metadata
+//      lookups back off and retry their own lane instead of
+//      cascading, and the HTML fallback is skipped entirely during
+//      a storm. Favorites page walks back off on 429 too.
+//
+//  v7.7.2 — RATE-LIMIT SHIELD — "API 403" during big scans is
+//    gone, at the root:
+//
+//    • WHY IT HAPPENED — Wallhaven's API allows ~45 requests a
+//      minute; big scans (multi-batch continues, ranked-window
+//      collection) burst past it, and the engine treated the 403
+//      reply as a hard error and parked the job.
+//
+//    • PREVENTION (PACING) — every scan request now passes a
+//      rate-limit gate: a rolling 60-second window with a
+//      36-request budget (20% headroom) and 250 ms spacing. Big
+//      scans flow at the maximum the API actually allows — instead
+//      of sprinting into a wall. Pace waits are sliced so Pause
+//      always responds instantly.
+//
+//    • RECOVERY (403 = "WAIT", NOT "DIE") — if a rate-limit reply
+//      still slips through, the page is retried with an exponential
+//      backoff (2s, 4s, 8s, 16s, 32s — a full limit window) and a
+//      live status, so the scan finishes by itself. Only a limit
+//      that never lifts parks the job — state saved, one Continue
+//      resumes it once the limit resets.
+//
+//    • CROSS-TAB — when any tab hits the limit it publishes a
+//      cooldown; every tab tightens its pacing until it expires,
+//      so parallel tabs can't keep re-triggering it.
+//
+//  v7.7.1 — FLOATING CONTINUE PILL — the final polish: the
+//    Continue button never lives at the bottom of the page again.
+//
+//    • ALWAYS ON SCREEN — the Continue pill is now a fixed,
+//      bottom-center floating element: one tap away at any scroll
+//      position, on every screen size. No scrolling down to reach
+//      it, ever. Professional, minimalist, unobtrusive — dark glass
+//      that matches the download manager, a single compact accent
+//      button, and nothing else.
+//
+//    • THREE CALM STATES — go (accent, clickable), load (spinner
+//      while scanning), done (a check, then the pill fades itself
+//      away after six seconds — informational states never linger
+//      on your screen).
+//
+//    • NO LOST CLICKS — a fresh state instantly revives a pill that
+//      was mid-fade; screen readers get role=status announcements;
+//      reduced-motion users get no animation; on phones the pill
+//      anchors left of the download manager so the two never
+//      collide.
+//
+//  v7.7.0 — BATCH PAGES & SUB-HISTORY — the final layer on the
+//    true-batch engine, exactly as requested:
+//
+//    • EVERY BATCH IS ITS OWN PAGE — serving a fresh batch starts
+//      from a clean grid (a page of its own), never a continuous
+//      stream. The DOM stays small — one batch, not the whole job —
+//      so rendering stays fast no matter how deep the job goes.
+//
+//    • SUB-HISTORY CARDS — each session card in Settings → Search
+//      history expands into one sub-card per completed batch
+//      (chevron + count badge). "View" opens that batch as its own
+//      separate page: only that batch's wallpapers, in serve order.
+//      The active session starts expanded; your toggles stick for
+//      the tab's lifetime.
+//
+//    • PER-BATCH PAYLOADS — every completed batch is persisted as
+//      its own ledger record + page payload (gf_bpage_<job>_<n>),
+//      including the final partial batch of an exhausted job. The
+//      in-progress batch keeps its crash-safe partial in the
+//      session key, so pause/refresh/resume never loses a page.
+//
+//    • CONTINUE = NEXT BATCH, SAME SESSION, ZERO REPEATS — the
+//      next batch scans on (e.g. 200 more) inside the exact same
+//      session, and the persistent served-id ledger guarantees it
+//      never includes a wallpaper any previous batch already
+//      served. Viewing an old batch page never disturbs the
+//      cursor; Continue rebuilds the live page first.
+//
+//    • BATCH LIMIT = SPEED — the engine stops at exactly the batch
+//      limit (default 200), fetching only the pages that batch
+//      needs; ranked windows serve instantly from memory. The
+//      count pill now counts the page you are looking at; the job
+//      strip keeps the job totals.
+//
+//  v7.6.2 — SERVE FIX — repairs three v7.6.1 defects:
+//
+//    • CRASH ON PAGE 2 OF COLLECTION — the ranked-window's
+//      one-page-ahead prefetch was stored as a raw Promise and
+//      never awaited, so every ranked job threw "r.data is not
+//      iterable" right after starting and served nothing.
+//      Fixed: the prefetch is awaited (a rejected probe falls
+//      back to a fresh, retried fetch) — ranked windows collect
+//      and serve again, fast and exactly like v7.5.1.
+//
+//    • PAUSE DURING COLLECTION — a pause that lands between
+//      awaits now parks the job paused with its state saved,
+//      instead of falsely completing the window and draining a
+//      partial pool.
+//
+//    • v7.5 SESSION RECOVERY — loading an old buffered session
+//      and pressing Continue no longer throws "bufLoad is not
+//      defined"; the unserved-tail recovery works as designed.
+//
+//    • SHARED PAGE CACHE — locator probes, collection pages and
+//      walk pages cache per sorting lane, so a page the binary
+//      search already probed is never fetched again during
+//      collection. Fewer requests, faster windows, kinder to
+//      the API rate limit.
+//
+//  v7.6.1 — RANKED WINDOW — fixes the v7.6.0 regression:
+//    favorites-sorted searches with a date window stopped
+//    serving anything. The v7.6 engine always walked the
+//    favorites-ordered index, where a date window is sparse
+//    (the top-favorites pages are years old) — so it skipped
+//    everything, hit the 50-page sparse limit and parked.
+//
+//    • RANKED WINDOW STRATEGY RESTORED — bounded favorites
+//      searches now collect the contiguous date window ONCE in
+//      upload order (every page inside winTop..winBot is already
+//      in range — the minimum possible discovery), rank the
+//      matches by ♥, and serve the top N of each batch instantly
+//      from memory. This is the v7.5.1 behavior — fast, exact and
+//      batch-first — now with the full v7.6 safety layer.
+//
+//    • STRATEGY SAMPLING RESTORED — windows over 60 pages sample
+//      the favorites region first (two probes): when the walk is
+//      clearly cheaper for the batch size it still walks;
+//      windows over 2,500 pages always walk. Small windows rank.
+//
+//    • RANK JOBS ARE FULL JOBS — crash-safe per-page checkpoints
+//      during collection, pause/resume mid-collection, retry
+//      after API errors, history ledger with collecting phase,
+//      and a persisted unserved-tail so Continue after a refresh
+//      is instant. A tail that outgrows its ledger cap
+//      re-verifies the window instead of lying "complete" —
+//      served wallpapers never repeat either way.
+//
+//    • v7.5 buffered sessions now convert into ranked-window
+//      jobs, recovering their unserved matches instead of
+//      re-walking from page one.
+//
+//  v7.6.0 — TRUE BATCH ENGINE — the scan finally respects the batch:
+//
+//    • ONLY THE PAGES EACH BATCH NEEDS — the old favorites-order
+//      strategy collected the entire date window (up to 2,500
+//      pages) before showing anything. That buffer is gone: the
+//      walk itself is favorites-descending, so batch 1 fetches
+//      just the pages that fill it (plus binary-search boundary
+//      probes that read a single item each), then stops mid-page
+//      with a resumable cursor. "Continue — next N" walks the
+//      next N eligible wallpapers and nothing else.
+//
+//    • NEVER PROCESSES A WALLPAPER TWICE — every job keeps a
+//      persistent ledger of served wallpaper ids (stable ids, not
+//      positions) that survives refreshes and browser restarts.
+//      Continue, resume, retry-after-error — and even Wallhaven
+//      re-ordering its results — can't make a served id re-serve.
+//
+//    • JOB LEDGER IN HISTORY — every entry records batch number,
+//      served/skipped counts, last activity, phase (awaiting ·
+//      paused · sparse · complete · error), the last served
+//      wallpaper and the resume cursor. Load inspects and resumes
+//      a job; the ↻ button restarts it from the beginning as a
+//      fresh entry; Delete wipes it completely.
+//
+//    • CRASH-SAFE CHECKPOINTS — cursor and counters persist after
+//      every page, not just at batch end. A crash or refresh
+//      mid-batch loses nothing.
+//
+//    • PAUSE IS REAL — the Stop button is now Pause: state saved
+//      after the current page, the button becomes Resume. API
+//      errors park the job retry-ready with the error recorded.
+//
+//    • SOURCE-SHIFT DETECTION — on resume after a refresh the
+//      engine verifies the page at the cursor still holds the
+//      last served wallpaper; if Wallhaven's results shifted it
+//      says so and continues safely (no duplicates, order may
+//      differ).
+//
+//    • LIVE JOB STRIP + DYNAMIC BATCH SIZE — the panel shows job,
+//      batch, in-batch progress, served/skipped/dupes and an
+//      estimate of what is left. Changing the Batch field between
+//      batches is respected on the very next Continue.
+//
 //  v7.5.1 — CONTROL POLISH — every button, working perfectly:
 //
 //    • SETTINGS MOVED TO THE TOP PANEL — a "Downloads" section in
@@ -417,7 +850,7 @@
 
 (function () {
     'use strict';
-    console.info('[naXim Labs] v7.5.1 executing');
+    console.info('[naXim Labs] v8.1.0 executing');
 
     /* ═══ PAGE DETECTION & BOOT GUARD ══════════════════════════════ */
 
@@ -459,6 +892,8 @@
         panelOpen : S('gf_open',   false),
         maxHistory: S('gf_mh',     20),
         hdMode    : S('gf_hdmode', false),
+        pagePill  : S('gf_pagepill', true),
+        pageBars  : S('gf_pagebars', true),
     };
     const get = k => cfg[k].get();
     const set = (k, v) => cfg[k].set(v);
@@ -560,26 +995,83 @@
 
     /* ═══ NETWORK LAYER ════════════════════════════════════════════ */
 
-    function apiRaw (url) {
-        return new Promise((res) => {
-            GM_xmlhttpRequest({
-                method: 'GET', url,
-                headers: { Accept: 'application/json', Referer: 'https://wallhaven.cc/' },
-                timeout: 20000,
-                onload (r) {
-                    if (r.status >= 400) { res({ _httpError: r.status }); return; }
-                    try { res(JSON.parse(r.responseText)); } catch { res({ _httpError: 0 }); }
-                },
-                onerror  : () => res({ _httpError: -1 }),
-                ontimeout: () => res({ _httpError: -2 }),
-            });
-        });
+    /* ── v7.7.3 UNIFIED RATE SHIELD ─────────────────────────────────
+       Wallhaven's API allows ~45 requests a minute — counted across
+       EVERYTHING the tab sends, not just scan pages. v7.7.2 paced the
+       scan walk only; wallpaper metadata (/w/), page-sync and the
+       HTML fallback still fired unpaced, and a throttled lookup
+       cascaded into up to three extra requests — keeping the shared
+       window saturated so the scan kept meeting 429s anyway. THE FIX:
+       the gate lives HERE, at the network layer — every request to
+       wallhaven.cc (API JSON or wallpaper-page HTML) passes the SAME
+       rolling 60-second window (36-request budget, 20% headroom; 20
+       while any tab's cooldown is live) with 250 ms spacing, and every
+       403/429 answer publishes the cross-tab cooldown and carries its
+       Retry-After into the callers' backoffs. Waits are sliced so a
+       scan Pause always responds instantly. */
+    const PACE_WINDOW      = 60000;       /* rolling rate-limit window */
+    const PACE_BUDGET      = 36;          /* requests per window — 20% under the 45/min limit */
+    const PACE_MIN_GAP     = 250;         /* ms between consecutive sends */
+    const PACE_COOL_BUDGET = 20;          /* tighter budget while the cross-tab cooldown is active */
+    const _paceLedger      = [];          /* timestamps of this tab's wallhaven.cc requests */
+    function paceBudgetNow () {
+        let b = PACE_BUDGET;
+        const until = parseInt(GM_getValue('gf_rl_until', '0'), 10) || 0;
+        if (Date.now() < until) b = Math.min(b, PACE_COOL_BUDGET);
+        return b;
     }
-    function apiSearch (params) {
+    async function paceGate (stopHook) {
+        for (let guard = 0; guard < 260; guard++) {
+            if (stopHook && stopHook()) return 'stopped';   /* a pause always beats pacing */
+            const now = Date.now();
+            while (_paceLedger.length && now - _paceLedger[0] > PACE_WINDOW) _paceLedger.shift();
+            if (_paceLedger.length < paceBudgetNow()) {
+                const gap = _paceLedger.length ? now - _paceLedger[_paceLedger.length - 1] : Infinity;
+                if (gap < PACE_MIN_GAP) await sleep(PACE_MIN_GAP - gap);
+                _paceLedger.push(Date.now());
+                return;
+            }
+            if (guard % 4 === 0)
+                setStatus('⏳ Pacing requests — ~' + Math.ceil(((_paceLedger[0] + PACE_WINDOW) - Date.now()) / 1000) + 's to stay under the API rate limit…');
+            await sleep(Math.max(Math.min((_paceLedger[0] + PACE_WINDOW) - Date.now() + 150, 1000), 250));
+        }
+        _paceLedger.push(Date.now());   /* clock frozen (tests / hostile env) — proceed, never spin */
+    }
+    function pacePublishRL (retryAfterSec) {
+        const ms = Math.max(60000, ((retryAfterSec || 0) * 1000) + 500);
+        try { GM_setValue('gf_rl_until', String(Date.now() + ms)); } catch (e) {}
+    }
+
+    function apiRaw (url, opts) {
+        const preGated = opts && opts.preGated;   /* the scan engine gates itself — count once */
+        return (async () => {
+            if (!preGated && (await paceGate()) === 'stopped') return { _httpError: -3 };
+            return new Promise((res) => {
+                GM_xmlhttpRequest({
+                    method: 'GET', url,
+                    headers: { Accept: 'application/json', Referer: 'https://wallhaven.cc/' },
+                    timeout: 20000,
+                    onload (r) {
+                        if (r.status >= 400) {
+                            const out = { _httpError: r.status };
+                            const ra = (String(r.responseHeaders || '').match(/retry-after:\s*(\d+)/i) || [])[1];
+                            if (ra) out._retryAfter = Math.min(120, parseInt(ra, 10) || 0);
+                            if (r.status === 403 || r.status === 429) pacePublishRL(out._retryAfter);
+                            res(out); return;
+                        }
+                        try { res(JSON.parse(r.responseText)); } catch { res({ _httpError: 0 }); }
+                    },
+                    onerror  : () => res({ _httpError: -1 }),
+                    ontimeout: () => res({ _httpError: -2 }),
+                });
+            });
+        })();
+    }
+    function apiSearch (params, opts) {
         const p = { ...params };
         const key = get('apiKey');
         if (key && !p.apikey) p.apikey = key;
-        return apiRaw('https://wallhaven.cc/api/v1/search?' + new URLSearchParams(p));
+        return apiRaw('https://wallhaven.cc/api/v1/search?' + new URLSearchParams(p), opts);
     }
 
     const _inflight = new Map();
@@ -599,7 +1091,8 @@
                   html.match(/(\d{4}-\d{2}-\d{2})[T ]\d{2}:\d{2}:\d{2}/);
         return m ? m[1] : '';
     }
-    function scrapeWallPage (id) {
+    async function scrapeWallPage (id) {
+        await paceGate();                     /* v7.7.3: the HTML fallback is paced too — one gate for everything */
         return new Promise((res) => {
             GM_xmlhttpRequest({
                 method: 'GET', url: 'https://wallhaven.cc/w/' + id, timeout: 20000,
@@ -628,19 +1121,34 @@
         const cached = _meta.get(id);
         if (cached && cached.path && cached.tagsFetched === true) return Promise.resolve(cached);
         return once('meta:' + id, async () => {
+            /* v7.7.3 lane machine: keyed API → keyless API → /w/ HTML.
+               A rate-limited lane is RETRIED in place (Retry-After
+               aware) and NEVER cascades — the old chain fired up to
+               three requests per wallpaper exactly while the server
+               was already saying slow down, which is what kept big
+               scans tripping the limit. */
             let d = null;
             const key = get('apiKey');
-            if (key) {
-                const r = await apiRaw('https://wallhaven.cc/api/v1/w/' + id + '?apikey=' + encodeURIComponent(key));
-                if (!r._httpError && r.data && r.data.path) d = r.data;
-            }
-            if (!d) {
-                const r = await apiRaw('https://wallhaven.cc/api/v1/w/' + id);
-                if (!r._httpError && r.data && r.data.path) d = r.data;
-            }
-            if (!d) {
-                const s = await scrapeWallPage(id);
-                if (s) d = { path: s.path, file_type: s.ext, resolution: '', tags: s.tags, created_at: s.created, thumbs: null };
+            let lane = key ? 0 : 1, rl = 0;
+            while (lane <= 2 && !d) {
+                if (lane < 2) {
+                    const r = await apiRaw('https://wallhaven.cc/api/v1/w/' + id + (lane === 0 ? '?apikey=' + encodeURIComponent(key) : ''));
+                    if (!r._httpError) {
+                        if (r.data && r.data.path) d = r.data;
+                    } else if (r._httpError === 403 || r._httpError === 429) {
+                        if (rl < 2) {                     /* same-lane backoff, server-timed */
+                            rl++;
+                            await sleep(Math.max(1500 * rl * rl, r._retryAfter ? r._retryAfter * 1000 + 250 : 0));
+                            continue;
+                        }
+                        break;                            /* hard rate limit: wait it out, never hammer */
+                    }
+                } else {
+                    const s = await scrapeWallPage(id);
+                    if (s) d = { path: s.path, file_type: s.ext, resolution: '', tags: s.tags, created_at: s.created, thumbs: null };
+                    break;
+                }
+                if (!d) lane++;
             }
             if (!d) return null;
             const ft = String(d.file_type || '');
@@ -684,6 +1192,13 @@
         const MAX_RUNNING = 3;
         const MAX_CACHED  = 4;
         const MAX_BYTES   = 64 << 20;
+        /* v8.1: stall watchdog — a transfer that stops moving (no bytes
+           for STALL_MS) or that has received every byte but never gets
+           its onload (COMPLETE_MS — the bridge lost the response) is
+           aborted and rejected with {stalled:true} so callers can retry
+           immediately instead of waiting out the full 45 s timeout. */
+        const STALL_MS    = 12000;
+        const COMPLETE_MS = 5000;
         const ABORT = () => Object.assign(new Error('aborted'), { aborted: true });
 
         const cache   = new Map();
@@ -704,15 +1219,35 @@
                 try { URL.revokeObjectURL(e.url); } catch {}
             }
         }
-        function settleResolve (job, url) { running.delete(job.key); job.resolve(url); pump(); }
-        function settleReject  (job, err) { running.delete(job.key); job.reject(err);  pump(); }
+        function settleResolve (job, url) { if (job.wd) { clearInterval(job.wd); job.wd = 0; } running.delete(job.key); job.resolve(url); pump(); }
+        function settleReject  (job, err) { if (job.wd) { clearInterval(job.wd); job.wd = 0; } running.delete(job.key); job.reject(err);  pump(); }
 
         function startJob (job) {
+            job.started = true;               /* v8.1 CRITICAL FIX: a running job MUST report itself as
+                                                  started, or cancel() takes the queue-removal branch, never
+                                                  aborts the transfer and never frees the slot — three fast
+                                                  HD navigations leaked all three pool slots and HD Mode
+                                                  stopped converting until a page refresh. */
+            job.loaded = 0; job.total = 0; job.lastMove = Date.now();
+            job.wd = setInterval(() => {
+                if (job.aborted) { clearInterval(job.wd); job.wd = 0; return; }
+                const idle = Date.now() - job.lastMove;
+                const completeHang = job.total > 0 && job.loaded >= job.total && idle > COMPLETE_MS;
+                if (idle > STALL_MS || completeHang) {
+                    clearInterval(job.wd); job.wd = 0;
+                    try { job.req && job.req.abort && job.req.abort(); } catch {}
+                    settleReject(job, Object.assign(new Error('stalled'), { stalled: true }));
+                }
+            }, 1500);
             job.req = GM_xmlhttpRequest({
                 method: 'GET', url: job.url, responseType: 'blob',
                 headers: { Referer: 'https://wallhaven.cc/' },
                 timeout: 45000,
-                onprogress (r) { if (!job.aborted && job.onprogress) job.onprogress(r.loaded || 0, r.total || 0); },
+                onprogress (r) {
+                    job.lastMove = Date.now();
+                    job.loaded = r.loaded || 0; job.total = r.total || 0;
+                    if (!job.aborted && job.onprogress) job.onprogress(r.loaded || 0, r.total || 0);
+                },
                 onload (r) {
                     if (job.aborted) return;
                     if (r.status !== 200 || !r.response) { settleReject(job, Object.assign(new Error('HTTP ' + r.status), { status: r.status })); return; }
@@ -1038,11 +1573,23 @@
     /* ─── network helpers ─────────────────────────────────────── */
 
     async function favHtml (url) {
-        const r = await fetch(url, { credentials: 'same-origin',
-            headers: { Accept: 'text/html,application/xhtml+xml' },
-            signal: (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) ? AbortSignal.timeout(20000) : undefined });
-        if (!r.ok) throw new Error('Wallhaven could not load the account collection page');
-        return r.text();
+        /* v7.7.3: collection pages can throttle under heavy walks —
+           back off on 429/403 (Retry-After aware) instead of failing
+           the whole index build. Website pages are a separate budget
+           from the API, so this ladder only heals; it never slows
+           saves, and it publishes nothing. */
+        for (let rl = 0; ; rl++) {
+            const r = await fetch(url, { credentials: 'same-origin',
+                headers: { Accept: 'text/html,application/xhtml+xml' },
+                signal: (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) ? AbortSignal.timeout(20000) : undefined });
+            const ra = parseInt((r.headers && r.headers.get && r.headers.get('retry-after')) || '', 10) || 0;
+            if ((r.status === 429 || r.status === 403) && rl < 3) {
+                await sleep(Math.max(2000 << rl, ra ? ra * 1000 + 250 : 0));
+                continue;
+            }
+            if (!r.ok) throw new Error('Wallhaven could not load the account collection page');
+            return r.text();
+        }
     }
     async function favRequestMethod (url, method) {
         const r = await fetch(url, { method, credentials: 'same-origin',
@@ -2997,6 +3544,437 @@
         sanitizeCard(t);
     }, { capture: true, passive: true });
 
+    /* ═══ PAGE BARS — a download button beside every page number ══
+     *
+     * v7.9.0 — every loaded page of the listing carries its own
+     * small download chip right beside its page number ("Page 4 /
+     * 9876"): one tap queues THAT page only — never the pages
+     * below it — through the exact classic download manager a
+     * single click uses.
+     *
+     *   • NATIVE HEADERS — wallhaven renders a header above every
+     *     page it appends while you scroll; the chip slots straight
+     *     into it, next to the number.
+     *   • THE HEADERLESS FIRST PAGE — wallhaven leaves the page-1
+     *     section without a header, so a matching bar is injected
+     *     ("Page 1 / 896" — the total from the listing's own
+     *     pagination data) and the chip lives there: every page is
+     *     equal.
+     *   • SCAN GRIDS — while the panel's search grid owns the
+     *     listing (nx-card figures) the first section's bar becomes
+     *     "Batch N" with the batch's live count; the stale native
+     *     header steps aside (hidden, never destroyed) until Clear
+     *     grid restores the listing and brings it back.
+     *   • LIVE LISTING — one childList observer on the thumbs
+     *     container notices every page wallhaven appends and wires
+     *     the new page's chip within a frame (rAF-coalesced; no
+     *     polling, no layout reads). The same tick lets the
+     *     floating pill re-read the DOM, so its number always
+     *     equals what a tap would queue.
+     *   • OFF SWITCH — "Page download buttons" in the panel's
+     *     Downloads section removes every trace live.
+     *
+     * The tap itself is a pure queue append — DL.add per wallpaper:
+     * duplicates can never double-download, and all network work
+     * happens inside the manager, behind the unified rate shield. */
+
+    const PageBar = (() => {
+        let scanCount = 0, mo = null, tick = false;
+        const raf = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (fn => setTimeout(fn, 16));
+        const START_PAGE = (() => {          /* the page this listing started on — captured at load, before scrolling rewrites the URL */
+            const q = new URLSearchParams(location.search).get('page');
+            return (q && /^\d+$/.test(q)) ? parseInt(q, 10) : 1;
+        })();
+
+        function host () {
+            const t = document.getElementById('thumbs');
+            if (t && t.tagName !== 'UL') return t;
+            const s = document.querySelector('section.thumb-listing-page');
+            return s ? s.parentNode : null;
+        }
+        function sections () {
+            const t = document.getElementById('thumbs');
+            if (t && t.tagName !== 'UL')
+                return Array.prototype.slice.call(t.querySelectorAll(':scope > section.thumb-listing-page'));
+            const s = document.querySelector('section.thumb-listing-page');
+            return s ? [s] : [];
+        }
+        function secFigs (sec) {
+            const out = [];
+            sec.querySelectorAll('figure.thumb[data-wallpaper-id]').forEach(f => {
+                const id = f.getAttribute('data-wallpaper-id');
+                if (id && out.indexOf(id) === -1) out.push(id);
+            });
+            return out;
+        }
+        function secNum (sec) {
+            const n = sec.querySelector('.thumb-listing-page-num');
+            if (n && /^\d+$/.test((n.textContent || '').trim())) return parseInt(n.textContent, 10);
+            const pg = sec.nextElementSibling;     /* this page's own pagination sits right after it */
+            if (pg && pg.classList && pg.classList.contains('pagination')) {
+                const cur = pg.querySelector('li.current');
+                if (cur && /^\d+$/.test((cur.textContent || '').trim())) return parseInt(cur.textContent, 10);
+            }
+            if (sec === sections()[0]) return START_PAGE;   /* the first section is the page the listing started on */
+            return 1;
+        }
+        function secTotal () {
+            const scope = document.getElementById('thumbs') || document;
+            const pg = scope.querySelector('ul.pagination[data-pagination]');
+            if (pg) {
+                try {
+                    const j = JSON.parse(pg.getAttribute('data-pagination'));
+                    if (j && j.total) return parseInt(j.total, 10);
+                } catch (e) {}
+            }
+            return 0;
+        }
+        function isScan () {
+            const s = sections()[0]; if (!s) return false;
+            const ul = s.querySelector(':scope > ul');
+            return !!(ul && ul.querySelector('figure.nx-card'));
+        }
+        function batchNo () {
+            if (_gridPage) { const b = _gridPage.split('#')[1]; if (b) return b; }
+            if (_session && _session.batchNum) return _session.batchNum;
+            return 0;
+        }
+        function flash (btn) {
+            btn.classList.remove('nx-pb-ok'); void btn.offsetWidth; btn.classList.add('nx-pb-ok');
+        }
+
+        /* the chip itself — one tap, one page, the classic queue */
+        function makeBtn (sec) {
+            const btn = mk('button', 'nx-pb');
+            btn.type = 'button';
+            btn.title = 'Download this page’s wallpapers — straight into the download manager';
+            btn.setAttribute('aria-label', 'Download the wallpapers on this page');
+            const ico = mk('span', 'nx-pb-i'); ico.innerHTML = IC.dl;
+            const num = mk('span', 'nx-pb-n');
+            btn.append(ico, num);
+            btn.addEventListener('click', () => {
+                const ids = secFigs(sec);
+                if (!ids.length) { setStatus('✕ Nothing to download — this page shows no wallpapers.', true); return; }
+                for (const id of ids) DL.add(id);   /* the exact queue a page of single clicks would fill */
+                flash(btn);
+                if (sec === sections()[0] && isScan()) {
+                    const b = batchNo();
+                    setStatus('✓ ' + (b ? 'Batch ' + b : 'Scan grid') + ' queued — ' + ids.length + ' wallpaper' +
+                              (ids.length === 1 ? '' : 's') + ' → download manager · duplicates skip automatically.');
+                } else {
+                    setStatus('✓ Page ' + secNum(sec) + ' queued — ' + ids.length + ' wallpaper' +
+                              (ids.length === 1 ? '' : 's') + ' → download manager · duplicates skip automatically.');
+                }
+            });
+            return btn;
+        }
+
+        /* an ownbar is injected only where wallhaven rendered no
+           header (the page-1 section) or while the scan grid owns
+           the listing; it reuses wallhaven's own header classes,
+           so it looks native everywhere */
+        function setKind (own, kind, num, total) {
+            let h2 = own.querySelector('h2');
+            if (!h2) { h2 = mk('h2'); own.insertBefore(h2, own.firstChild); }
+            h2.textContent = '';
+            if (kind === 'batch') {
+                if (num) { const s = mk('span', 'thumb-listing-page-num'); s.textContent = String(num); h2.append('Batch ', s); }
+                else h2.textContent = 'Scan results';
+            } else {
+                const s = mk('span', 'thumb-listing-page-num'); s.textContent = String(num || 1);
+                h2.append('Page ', s);
+                if (total && total > 1) h2.appendChild(document.createTextNode(' / ' + total));
+            }
+        }
+        function paintCount (sec) {
+            /* v8.1: update EVERY chip the section carries — a scan-mode
+               section can hold one in the CSS-hidden native header and
+               one in the visible ownbar at the same time */
+            const val = ((sec === sections()[0] && isScan()) ? scanCount : secFigs(sec).length).toLocaleString();
+            sec.querySelectorAll(':scope > header.thumb-listing-page-header .nx-pb').forEach(btn => {
+                const n = btn.querySelector('.nx-pb-n'); if (n && n.textContent !== val) n.textContent = val;
+            });
+        }
+        function wire (sec) {
+            if (!sec || !sec.querySelector) return;
+            const native = sec.querySelector(':scope > header.thumb-listing-page-header:not(.nx-ownbar)');
+            let own = sec.querySelector(':scope > header.nx-ownbar');
+            if (!native && !own) {
+                own = mk('header', 'thumb-listing-page-header nx-ownbar');
+                setKind(own, 'page', secNum(sec), secTotal());
+                sec.insertBefore(own, sec.firstChild);
+            }
+            const h = native || own;
+            if (h && !h.querySelector('.nx-pb')) h.appendChild(makeBtn(sec));
+            paintCount(sec);
+        }
+        function paintScanMode () {
+            const sec = sections()[0]; if (!sec) return;
+            const scan = isScan();
+            sec.classList.toggle('nx-scanmode', scan);
+            let own = sec.querySelector(':scope > header.nx-ownbar');
+            const native = sec.querySelector(':scope > header.thumb-listing-page-header:not(.nx-ownbar)');
+            if (scan) {
+                if (!own) {
+                    own = mk('header', 'thumb-listing-page-header nx-ownbar');
+                    sec.insertBefore(own, sec.firstChild);
+                }
+                setKind(own, 'batch', batchNo(), 0);
+                own.hidden = false;
+                /* v8.1 FIX: when the listing's first section carries a
+                   native header (a /search?page=2+ URL), scan mode hides
+                   it — and with it the per-batch chip that lived inside.
+                   The visible ownbar now carries its OWN chip, so
+                   "Batch N" always has its single-batch button. */
+                if (get('pageBars') && !own.querySelector('.nx-pb')) own.appendChild(makeBtn(sec));
+            } else if (own) {
+                own.hidden = !!native;
+                if (!native) setKind(own, 'page', secNum(sec), secTotal());
+                const stray = own.querySelector('.nx-pb');            /* v8.1: back to the listing — the native header owns the chip again */
+                if (stray && native && native.querySelector('.nx-pb')) stray.remove();
+            }
+            paintCount(sec);
+        }
+        function wireAll () { sections().forEach(wire); paintScanMode(); }
+        function removeAll () {
+            sections().forEach(sec => {
+                sec.classList.remove('nx-scanmode');
+                const own = sec.querySelector(':scope > header.nx-ownbar'); if (own) own.remove();
+                sec.querySelectorAll(':scope > header.thumb-listing-page-header .nx-pb').forEach(b => b.remove());
+            });
+        }
+
+        /* one observer for the whole listing: a new page appears,
+           its chip gets wired and the pill re-reads the truth — a
+           frame later, never mid-layout */
+        function onTick () {
+            try { PagePill.recount(); } catch (e) {}   /* the pill re-reads the same DOM */
+            if (get('pageBars')) wireAll();
+        }
+        function start () {
+            if (mo) return;
+            const h = host();
+            if (!h || typeof MutationObserver !== 'function') return;
+            mo = new MutationObserver(() => {
+                if (tick) return;
+                tick = true;
+                raf(() => { tick = false; onTick(); });
+            });
+            mo.observe(h, { childList: true });
+        }
+        function boot () {
+            if (!document.body) return;
+            start();
+            if (get('pageBars')) wireAll(); else removeAll();
+        }
+
+        return {
+            boot: boot,
+            sync: boot,                              /* the panel toggle asks for exactly this */
+            onCount: n => { scanCount = n || 0; paintScanMode(); },  /* the grid's renders feed the scan bar */
+        };
+    })();
+
+    /* ═══ PAGE PILL — one tap queues everything on screen ═════════
+     *
+     * v7.9.0 — the pill finally tells the truth. It queues EVERY
+     * wallpaper currently loaded on the listing — that is the
+     * feature: want three pages? Scroll until three pages sit on
+     * screen, tap once, and all of them ride the classic queue,
+     * exactly as if you had clicked every wallpaper one by one.
+     *
+     *   • THE COUNT IS THE CONTRACT — the number is recomputed from
+     *     the live DOM every time anything changes (the page bars'
+     *     observer pokes it when wallhaven appends a page; the
+     *     panel's own setCount feeds it when the search grid
+     *     renders), and the tap harvests the very same list — so
+     *     the label can never say 24 while it queues 72.
+     *   • THE TAG NAMES THE RANGE — "page 2" for one page, "pages
+     *     1–3" for a contiguous run, "batch 4" while the search
+     *     grid owns the listing; nothing on random.
+     *   • THE QUEUE IS THE CLASSIC ONE — DL.add per wallpaper, in
+     *     DOM order: identical concurrency, pacing, byte-accurate
+     *     transfers, names, dedupe, retry, pause/resume, cross-tab
+     *     sync and telemetry. Zero requests at tap time — all
+     *     network work happens inside the manager, behind the
+     *     rate shield.
+     *   • The pill hides itself when there is nothing to queue and
+     *     can be turned off in the panel's Downloads section. */
+
+    const PagePill = (() => {
+        let root = null, numEl = null, tagEl = null, lastCount = 0, lastTag = '';
+        const raf = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (fn => setTimeout(fn, 16));
+        const START_PAGE = (() => {          /* the page this listing started on — captured at load, before scrolling rewrites the URL */
+            const q = new URLSearchParams(location.search).get('page');
+            return (q && /^\d+$/.test(q)) ? parseInt(q, 10) : 1;
+        })();
+
+        function listSections () {
+            const t = document.getElementById('thumbs');
+            if (t && t.tagName !== 'UL')
+                return Array.prototype.slice.call(t.querySelectorAll(':scope > section.thumb-listing-page'));
+            const s = document.querySelector('section.thumb-listing-page');
+            return s ? [s] : [];
+        }
+        function scanGrid () {                    /* the panel's search grid owns the listing */
+            const first = listSections()[0]; if (!first) return false;
+            const ul = first.querySelector(':scope > ul');
+            return !!(ul && ul.querySelector('figure.nx-card'));
+        }
+
+        /* v8.1 — BATCH RANGE: which job owns the grid, and the batches
+           between batch 1 and the batch on screen — exactly the way the
+           pill treats the pages you scrolled to load ("pages 1–4").
+           The live in-progress batch counts as the current page; the
+           count always equals the harvest. */
+        function accInfo () {
+            const jid = (_gridPage ? String(_gridPage).split('#')[0] : '') || (_session ? _session.id : '');
+            if (!jid) return null;
+            const live = (_session && _session.id === jid) ? _session : null;
+            const st = live ? null : ((historyLoad().find(e => e.id === jid) || {}).state || null);
+            const batches = ((live ? (live.batches || []) : (jobLoad(jid).batches || [])))
+                .filter(b => b && b.n && b.count > 0)
+                .sort((a, b) => a.n - b.n);
+            if (!batches.length) return null;      /* first batch still collecting — the DOM is the truth */
+            const partial = live ? (live.batchServed || 0) : ((st && st.batchServed) || 0);
+            const liveN = live ? (live.batchNum || 0) : ((st && st.batchNum) || 0);
+            /* the batch the screen is showing — the pill queues 1..it */
+            const viewing = (parseInt(_gridPage ? String(_gridPage).split('#')[1] : '', 10) || 0) ||
+                            liveN || batches[batches.length - 1].n;
+            const hi = Math.max(1, viewing);
+            return { jid: jid, live: live, batches: batches, partial: partial, hi: hi,
+                     withLive: partial > 0 && liveN === hi && !batches.some(b => b.n === hi) };
+        }
+        function accCount (a) {
+            let n = 0;
+            for (const b of a.batches) if (b.n <= a.hi) n += b.count || 0;
+            if (a.withLive) n += a.partial;
+            return n;
+        }
+        function accIds (a) {
+            const out = [];
+            for (const b of a.batches) {
+                if (b.n > a.hi) continue;
+                bpageLoad(a.jid, b.n).forEach(w => { const id = String(w.id); if (id && out.indexOf(id) === -1) out.push(id); });
+            }
+            if (a.withLive)
+                (a.live ? (a.live.batchItems || []) : batchLoad(a.jid)).forEach(w => { const id = String(w.id); if (id && out.indexOf(id) === -1) out.push(id); });
+            return out;
+        }
+        function scopeNode () {                    /* what "on screen" means right now */
+            const t = document.getElementById('thumbs');
+            if (t && t.tagName !== 'UL') {
+                const first = t.querySelector(':scope > section.thumb-listing-page');
+                const ul = first && first.querySelector(':scope > ul');
+                if (ul && ul.querySelector('figure.nx-card')) return first;   /* the grid, never the stale pages below it */
+                return t;                                                       /* every page you've scrolled to load */
+            }
+            if (t) return t;                                                     /* legacy flat listing */
+            const s = document.querySelector('section.thumb-listing-page');
+            return s || document;
+        }
+        function scopedIds () {
+            const out = [];
+            scopeNode().querySelectorAll('figure.thumb[data-wallpaper-id]').forEach(f => {
+                const id = f.getAttribute('data-wallpaper-id');
+                if (id && out.indexOf(id) === -1) out.push(id);
+            });
+            return out;
+        }
+
+        /* which pages the scope covers — the sections' own numbers
+           (headers first, then each page's pagination cell, then the
+           URL), the batch's number on scan grids, nothing on random */
+        function pageTag () {
+            if (scanGrid()) {
+                const a = accInfo();
+                if (a) return a.hi > 1 ? 'batches 1–' + a.hi : 'batch 1';   /* v8.1: the whole served range up to this page, honestly named */
+                if (_gridPage) { const b = _gridPage.split('#')[1]; if (b) return 'batch ' + b; }
+                if (_session && _session.batchNum) return 'batch ' + _session.batchNum;
+                return 'scan';
+            }
+            if (PAGE_TYPE === 'random') return '';
+            const secs = listSections();
+            const nums = [];
+            secs.forEach(sec => {
+                const n = sec.querySelector('.thumb-listing-page-num');
+                let v = (n && /^\d+$/.test((n.textContent || '').trim())) ? parseInt(n.textContent, 10) : 0;
+                if (!v) {
+                    const pg = sec.nextElementSibling;
+                    const cur = (pg && pg.classList && pg.classList.contains('pagination')) ? pg.querySelector('li.current') : null;
+                    v = (cur && /^\d+$/.test((cur.textContent || '').trim())) ? parseInt(cur.textContent, 10) : 0;
+                }
+                if (!v && sec === secs[0]) v = START_PAGE;   /* the headerless first section started this listing */
+                if (v && nums.indexOf(v) === -1) nums.push(v);
+            });
+            if (!nums.length) return '';
+            nums.sort((a, b) => a - b);
+            if (nums.length === 1) return 'page ' + nums[0];
+            if (nums[nums.length - 1] - nums[0] + 1 === nums.length)
+                return 'pages ' + nums[0] + '–' + nums[nums.length - 1];
+            return nums.length + ' pages';
+        }
+
+        function paint () {
+            if (!root || !root.isConnected) return;
+            const scan = scanGrid();
+            lastTag = pageTag();
+            numEl.textContent = lastCount.toLocaleString();
+            tagEl.textContent = lastTag;
+            root.classList.toggle('on', lastCount > 0);   /* nothing to queue shows nothing to tap */
+            const what = scan ? 'every batch from batch 1 to the batch on screen' : 'every wallpaper on screen';
+            root.title = 'Download ' + what + (lastTag ? ' (' + lastTag + ')' : '') +
+                         ' — straight into the download manager';
+            root.setAttribute('aria-label', 'Download ' + what + (lastTag ? ' — ' + lastTag : ''));
+        }
+
+        function build () {
+            root = mk('button', 'nx-pg');
+            root.type = 'button';
+            root.id = 'nx-pg';
+            const ico = mk('span', 'nx-pg-i'); ico.innerHTML = IC.dl;
+            numEl = mk('span', 'nx-pg-n'); numEl.textContent = '0';
+            tagEl = mk('span', 'nx-pg-t');
+            root.append(ico, numEl, tagEl);
+            root.addEventListener('click', () => {
+                const a = scanGrid() ? accInfo() : null;   /* v8.1: on a scan grid the pill queues the served range up to this page */
+                const ids = a ? accIds(a) : scopedIds();
+                if (!ids.length) { setStatus('✕ Nothing to download — this page shows no wallpapers.', true); return; }
+                for (const id of ids) DL.add(id);   /* the exact queue N single clicks would fill */
+                root.classList.remove('nx-pg-ok'); void root.offsetWidth; root.classList.add('nx-pg-ok');
+                const tag = pageTag();
+                const what = tag ? tag.charAt(0).toUpperCase() + tag.slice(1) : 'Page';
+                setStatus('✓ ' + what + ' queued — ' + ids.length + ' wallpaper' + (ids.length === 1 ? '' : 's') +
+                          ' → download manager · duplicates skip automatically.');
+            });
+            document.body.appendChild(root);
+            raf(() => recount());                   /* entrance fades in through .on, count from the truth */
+        }
+        function recount () {
+            const a = scanGrid() ? accInfo() : null;      /* v8.1: on scan grids the number is the served range, not the DOM */
+            lastCount = a ? accCount(a) : scopedIds().length;
+            paint();
+        }
+
+        function boot () {
+            if (!document.body) return;
+            if (get('pagePill')) { if (!root || !root.isConnected) build(); else recount(); }
+            else if (root && root.isConnected) root.remove();
+            paint();
+        }
+
+        return {
+            boot: boot,
+            sync: boot,                             /* the panel toggle asks for exactly this */
+            recount: recount,                       /* the listing changed — re-read the truth */
+            onCount: n => {                          /* the grid's own renders feed the number */
+                const a = scanGrid() ? accInfo() : null;
+                lastCount = a ? accCount(a) : (n || 0);
+                paint();
+            },
+        };
+    })();
+
     /* ═══ LIGHTBOX ════════════════════════════════════════════════ */
 
     const MAX_ZOOM = 8;
@@ -3044,13 +4022,29 @@
         R.tx = Math.min(mx, Math.max(-mx, R.tx));
         R.ty = Math.min(my, Math.max(-my, R.ty));
     }
+    /* v7.9.1 — the HD layer keeps its TRUE natural pixel size and is
+       fitted by the transform itself (zoom * hdFitScale), so the
+       browser always holds a full-quality decode and zooming only
+       ever samples DOWN from native pixels. The preview keeps the
+       classic fit-sized box; both share the same translate because
+       transform-origin is each box's center and both boxes are
+       flex-centered on the same stage center — the two layers stay
+       pixel-aligned at every zoom (proof: the hd transform's scale
+       maps natW to the same on-screen width zoom*baseW gives the
+       preview, and the translate is applied in screen space for
+       both). */
+    function hdFitScale (R) {
+        if (!R.hdNat || !R.cw || !R.ch) return 1;
+        return Math.min(R.cw / R.hdNat.w, R.ch / R.hdNat.h);
+    }
     function applyZoom (anim) {
         const R = _lbR; if (!R) return;
         const t = 'translate3d(' + R.tx.toFixed(2) + 'px,' + R.ty.toFixed(2) + 'px,0) scale(' + R.zoom.toFixed(4) + ')';
+        const th = R.hdEl ? 'translate3d(' + R.tx.toFixed(2) + 'px,' + R.ty.toFixed(2) + 'px,0) scale(' + (R.zoom * hdFitScale(R)).toFixed(4) + ')' : null;
         for (const im of [R.pvEl, R.hdEl]) {
             if (!im) continue;
             im.classList.toggle('nx-anim', !!anim);
-            im.style.transform = t;
+            im.style.transform = (im === R.hdEl && th) ? th : t;
         }
     }
     function updateZoomUI (R) {
@@ -3076,6 +4070,21 @@
         updateZoomUI(R);
     }
     function zoomStep (f) { const R = _lbR; if (!R) return; setZoom(R.zoom * f, null, true); }
+
+    /* v7.9.1 — one tap to TRUE native pixels: the zoom factor that
+       makes the active layer (the HD image when shown, else the
+       preview) render one image pixel per screen pixel. */
+    function oneToOneZoom (R) {
+        const nat = (R.hdEl && !R.hdEl.classList.contains('nx-off') && R.hdNat) ? R.hdNat
+                  : (R.pvEl ? { w: R.pvEl.naturalWidth, h: R.pvEl.naturalHeight } : R.baseNat);
+        if (!nat || !nat.w || !R.cw || !R.ch) return 1;
+        const fs = Math.min(R.cw / nat.w, R.ch / nat.h);
+        return fs > 0 ? Math.max(1, 1 / fs) : 1;
+    }
+    function zoomNative () {
+        const R = _lbR; if (!R || !R.baseW) return;
+        setZoom(oneToOneZoom(R), null, true);
+    }
 
     const _wheelPt = { x: 0, y: 0 };
     let _wheelAcc = 0, _wheelRaf = false;
@@ -3157,11 +4166,22 @@
             if (_lbR !== R) return;
             R.cRect = R.stage.getBoundingClientRect();
             if (!R.baseNat) return;
-            const primary = R.pvEl || R.hdEl;
-            if (primary) sizeImg(primary, R.baseNat.w, R.baseNat.h, true);
-            for (const im of [R.thumbEl, R.pvEl, R.hdEl]) {
-                if (im && im !== primary) sizeImg(im, R.baseNat.w, R.baseNat.h, false);
+            /* v7.9.1 — the preview re-fits, but the HD layer keeps its
+               true natural box; only its transform's fitScale follows
+               the new stage (applyZoom recomputes it from R.cw/R.ch),
+               and a preview-less HD view re-derives the zoom base from
+               its own natural size. */
+            if (R.pvEl) sizeImg(R.pvEl, R.baseNat.w, R.baseNat.h, true);
+            else if (R.hdEl && R.hdNat) {
+                stageBox(R);
+                if (R.cw && R.ch) {
+                    const s = Math.min(R.cw / R.hdNat.w, R.ch / R.hdNat.h);
+                    R.baseW = Math.max(1, Math.round(R.hdNat.w * s));
+                    R.baseH = Math.max(1, Math.round(R.hdNat.h * s));
+                    clampPan(R); applyZoom(false); updateZoomUI(R);
+                }
             }
+            if (R.thumbEl) sizeImg(R.thumbEl, R.baseNat.w, R.baseNat.h, false);
         });
     }
     function lbKey (e) {
@@ -3173,6 +4193,7 @@
             case '+': case '=': e.preventDefault(); zoomStep(1.45); break;
             case '-': case '_': e.preventDefault(); zoomStep(1 / 1.45); break;
             case '0': case 'f': case 'F': e.preventDefault(); setZoom(1, null, true); break;
+            case '1': e.preventDefault(); zoomNative(); break;
         }
     }
 
@@ -3229,16 +4250,38 @@
         if (R.bloomSrc !== src) { R.bloomImg.src = src; R.bloomSrc = src; }
         R.bloom.style.opacity = '';
     }
-    function addChip (txt) {
-        const s = mk('span', 'nx-lb-chip'); s.textContent = txt;
-        _lbR.metaX.appendChild(s);
+    /* v7.9.1 — the meta bar is a pure render of R.data (plus the HD
+       natural size when present). applyMeta MERGES whatever arrives —
+       the cached partial first, then the full fresh record — and
+       every merge re-renders the chips from scratch, so a late
+       arrival can never duplicate a chip and the tags always land on
+       the FIRST open. */
+    function renderMetaChips (R) {
+        const d = R.data || {};
+        R.metaX.textContent = '';
+        if (d.tags && d.tags.length) {
+            const s = mk('span', 'nx-lb-chip'); s.textContent = d.tags.slice(0, 6).join(' · ');
+            R.metaX.appendChild(s);
+        }
+        if (d.created) {
+            const s = mk('span', 'nx-lb-chip'); s.textContent = fmtDate(d.created);
+            R.metaX.appendChild(s);
+        }
+        const res = R.resVal || d.resolution || '';
+        if (res) {
+            const s = mk('span', 'nx-lb-chip'); s.textContent = res;
+            R.metaX.appendChild(s);
+        }
     }
     function applyMeta (m) {
-        const R = _lbR; if (!R) return;
-        if (m.tags && m.tags.length) addChip(m.tags.slice(0, 6).join(' · '));
-        if (m.created) addChip(fmtDate(m.created));
-        R.data = { path: m.path, ext: m.ext, tags: m.tags || [] };
-        if (m.resolution && !R.hasRes) { R.hasRes = true; addChip(m.resolution); }
+        const R = _lbR; if (!R || !m) return;
+        const d = R.data || (R.data = {});
+        if (m.path) d.path = m.path;
+        if (m.ext) d.ext = m.ext;
+        if (m.tags && m.tags.length) d.tags = m.tags;
+        if (m.created) d.created = m.created;
+        if (m.resolution) d.resolution = m.resolution;
+        renderMetaChips(R);
     }
     function lbShowError (msg) {
         const R = _lbR; if (!R) return;
@@ -3269,9 +4312,15 @@
         const st = R.hdState;
         R.hdBtn.classList.toggle('nx-on', !!R.hdOn);
         R.hdBtn.classList.toggle('nx-load', st === 'load');
+        R.hdBtn.classList.toggle('nx-proc', st === 'load' && !!R.hdProc);
         R.hdBtn.classList.toggle('nx-retry', st === 'retry');
         R.hdIco.innerHTML = st === 'ok' ? IC.ok : st === 'retry' ? IC.sync : IC.hd;
-        R.hdLbl.textContent = st === 'retry' ? 'Retry HD' : 'HD Mode';
+        /* v8.1: the label narrates the real phase — MB while bytes
+           flow, "Rendering" while the bitmap decodes, never a blank
+           stare at a full bar. */
+        R.hdLbl.textContent = st === 'retry' ? 'Retry HD'
+            : (st === 'load' && R.hdLblTxt) ? R.hdLblTxt
+            : 'HD Mode';
         R.hdBtn.title = st === 'retry' ? 'Retry HD for this wallpaper' : 'Toggle HD Mode (persistent)';
         R.hdBtn.setAttribute('aria-label', st === 'retry' ? 'Retry HD' : 'Toggle HD Mode');
     }
@@ -3293,6 +4342,14 @@
         });
     }
 
+    /* v8.1: the label's live byte readout — throttled to whole-MB
+       steps so the text never thrashes on fast links. */
+    const fmtMB = b => (b / 1048576).toFixed(1);
+    function hdLblBytes (R, loaded, total) {
+        const txt = total > 0 ? fmtMB(loaded) + ' / ' + fmtMB(total) + ' MB' : fmtMB(loaded) + ' MB';
+        if (R.hdLblNext !== txt) { R.hdLblNext = txt; R.hdLblTxt = txt; hdBtnSync(R); }
+    }
+
     function setHDMode (on) {
         on = !!on;
         set('hdMode', on);
@@ -3305,6 +4362,7 @@
             if (R.hdEl) R.hdEl.classList.add('nx-off');
             if (R.pvEl) R.pvEl.classList.remove('nx-off');
             R.hdState = 'idle';
+            R.hdProc = false; R.hdLblTxt = ''; R.hdLblNext = '';
             hdBtnSync(R);
             return;
         }
@@ -3317,6 +4375,7 @@
         clearTimeout(R.hdRetryT); R.hdRetryT = 0;
         const gen = ++R.hdGen, tok = _lbTok;
         R.hdState = 'load';
+        R.hdProc = false; R.hdLblTxt = ''; R.hdLblNext = '';   /* v8.1: every attempt starts the bar from a clean slate */
         R.hdBar.classList.remove('nx-indet');
         R.hdBarI.style.width = '';
         hdSetProg(R, -1);
@@ -3332,7 +4391,15 @@
                 const u = await ImagePool.request(id, p, {
                     kind: 'main',
                     onprogress: (l, t) => {
-                        if (tok === _lbTok && gen === R.hdGen && R.hdOn && t > 0) hdSetProg(R, l / t);
+                        if (tok !== _lbTok || gen !== R.hdGen || !R.hdOn) return;
+                        /* v8.1: the bar NEVER reads 100% while still
+                           downloading — a full bar that does nothing is
+                           the oldest lie in progress UIs. Unknown totals
+                           (no Content-Length) run the indeterminate
+                           shimmer instead of freezing. */
+                        if (t > 0) hdSetProg(R, Math.min(0.992, l / t));
+                        else if (l > 0) hdSetProg(R, -1);
+                        hdLblBytes(R, l, t);
                     },
                 });
                 if (u) usedPath = p;
@@ -3354,16 +4421,54 @@
         if (tok !== _lbTok || gen !== R.hdGen || !R.hdOn) return;
         if (!url) { hdFail(R, gen, tok, lastErr); return; }
 
+        /* v8.1: pin the blob for the WHOLE decode — an eviction under
+           cache pressure used to revoke the object URL mid-decode and
+           kill the conversion (the retry then re-downloaded it). */
+        ImagePool.pin(id);
+        if (R.pinnedId && R.pinnedId !== id) ImagePool.unpin(R.pinnedId);
+        R.pinnedId = id;
+
+        /* v8.1: the blob landed — flip the bar to a distinct green
+           "Rendering" shimmer while the bitmap decodes, so the gap
+           between download-done and image-on-screen is narrated. */
+        R.hdProc = true; R.hdLblTxt = 'Rendering…'; R.hdLblNext = '';
+        hdSetProg(R, 1);
+        const hdToIndet = () => { if (_lbR === R && R.hdState === 'load' && R.hdProc) hdSetProg(R, -1); };
+        requestAnimationFrame(hdToIndet);
+        setTimeout(hdToIndet, 140);      /* rAF freezes in background tabs — the shimmer must not */
+        hdBtnSync(R);
+
         const img = new Image();
         img.className = 'nx-lb-img nx-off';
         img.decoding = 'async'; img.draggable = false; img.alt = 'wallpaper ' + id;
         img.src = url;
-        try { if (img.decode) await img.decode(); } catch {}
-        if (tok !== _lbTok || gen !== R.hdGen || !R.hdOn) return;
-        if (!img.naturalWidth) { hdFail(R, gen, tok, null); return; }
+        /* v8.1: decode is raced against a hard 8 s bound — an exotic
+           or pathological codec can never wedge the pipeline; if the
+           metadata has parsed by then, naturalWidth carries us. */
+        try { if (img.decode) await Promise.race([img.decode().catch(() => {}), sleep(8000)]); } catch {}
+        if (tok !== _lbTok || gen !== R.hdGen || !R.hdOn) {
+            if (_lbR !== R && R.pinnedId === id) { ImagePool.unpin(id); R.pinnedId = null; }   /* v8.1: the lightbox is gone — don't leak the pin */
+            return;
+        }
+        if (!img.naturalWidth) {
+            /* v8.1 second chance — an image that already settled fires
+               no further events, so img.complete answers instantly
+               and only a genuinely pending load waits (6 s cap). */
+            const gotNat = img.complete
+                ? !!img.naturalWidth                  /* already settled — loaded or errored, no events will ever fire */
+                : await Promise.race([
+                    new Promise(res => { img.onload = () => res(true); img.onerror = () => res(false); }),
+                    sleep(6000).then(() => false),
+                ]);
+            if (tok !== _lbTok || gen !== R.hdGen || !R.hdOn) {
+                if (_lbR !== R && R.pinnedId === id) { ImagePool.unpin(id); R.pinnedId = null; }   /* v8.1: the lightbox is gone — don't leak the pin */
+                return;
+            }
+            if (!gotNat || !img.naturalWidth) { hdFail(R, gen, tok, null); return; }
+        }
 
-        if (R.baseW) { img.style.width = R.baseW + 'px'; img.style.height = R.baseH + 'px'; }
-        else sizeImg(img, img.naturalWidth, img.naturalHeight, true);
+        /* v7.9.1 — no fit-box pre-sizing: hdMount lays the HD layer
+           out at its TRUE natural pixel size. */
         R.hdEl = img;
         if (usedPath) R.hdPath = usedPath;
         R.stage.appendChild(img);
@@ -3372,7 +4477,23 @@
 
     function hdFail (R, gen, tok, err) {
         if (tok !== _lbTok || gen !== R.hdGen || !R.hdOn) return;
-        if (err && err.aborted) return;
+        /* v8.1: an aborted attempt while this lightbox is STILL the
+           current target used to return silently and leave the 'load'
+           state (and its bar) frozen forever. It now re-arms through
+           the same retry ladder as any other failure. */
+        if (err && err.aborted) {
+            R.hdTries++;
+            if (R.hdTries < HD_MAX_TRIES) {
+                const delay = HD_BACKOFF[Math.min(R.hdTries - 1, HD_BACKOFF.length - 1)];
+                hdSetProg(R, -1);
+                R.hdRetryT = setTimeout(() => {
+                    R.hdRetryT = 0;
+                    if (!_lb || _lbR !== R || tok !== _lbTok || gen !== R.hdGen || !R.hdOn) return;
+                    hdBegin(R);
+                }, delay);
+            } else { R.hdState = 'retry'; hdBtnSync(R); }
+            return;
+        }
         R.hdTries++;
         if (R.hdTries < HD_MAX_TRIES) {
             const delay = HD_BACKOFF[Math.min(R.hdTries - 1, HD_BACKOFF.length - 1)];
@@ -3389,16 +4510,39 @@
         if (!R.pvEl && !R.thumbEl) lbShowError('Full resolution unavailable.');
     }
 
+    /* v7.9.1 — lay the HD layer out at its TRUE natural pixel size.
+       This is the whole fix for the 8K bug: an <img> whose layout box
+       is much smaller than its bitmap gets its decode clamped to the
+       box, and a CSS transform zoom then only upscales that clamp.
+       At natural size the decode is always full quality; the zoom
+       transform (zoom * fitScale) only ever shrinks real pixels. */
+    function hdMount (R) {
+        const im = R.hdEl; if (!im) return;
+        const nw = im.naturalWidth, nh = im.naturalHeight;
+        if (!nw || !nh) return;
+        R.hdNat = { w: nw, h: nh };
+        im.classList.add('nx-lb-hdnat');
+        im.style.width  = nw + 'px';
+        im.style.height = nh + 'px';
+        if (!R.baseW) {                    /* no preview ever sized: the HD image is the base */
+            stageBox(R);
+            if (!R.cw || !R.ch) return;
+            const s = Math.min(R.cw / nw, R.ch / nh);
+            R.baseW = Math.max(1, Math.round(nw * s));
+            R.baseH = Math.max(1, Math.round(nh * s));
+            R.baseNat = { w: nw, h: nh };
+            clampPan(R); applyZoom(false); updateZoomUI(R);
+            R.zc.classList.add('on');
+        } else applyZoom(false);
+    }
     function hdApply (R) {
         if (!R.hdEl) return;
         R.hdOn = true;
         R.hdState = 'ok';
+        R.hdProc = false; R.hdLblTxt = ''; R.hdLblNext = '';   /* v8.1: clear the narrated phase */
         clearTimeout(R.hdRetryT); R.hdRetryT = 0;
         if (R.thumbEl) { R.thumbEl.remove(); R.thumbEl = null; }
-        if (!R.hdEl.style.width) {
-            if (R.baseW) { R.hdEl.style.width = R.baseW + 'px'; R.hdEl.style.height = R.baseH + 'px'; }
-            else sizeImg(R.hdEl, R.hdEl.naturalWidth, R.hdEl.naturalHeight, true);
-        }
+        hdMount(R);
         if (R.pvEl) R.pvEl.classList.add('nx-off');
         R.hdEl.classList.remove('nx-off');
         R.hdEl.classList.remove('nx-hd-in');
@@ -3408,7 +4552,7 @@
         ImagePool.pin(_lbId);
         if (R.pinnedId && R.pinnedId !== _lbId) ImagePool.unpin(R.pinnedId);
         R.pinnedId = _lbId;
-        if (!R.hasRes) { R.hasRes = true; addChip(R.hdEl.naturalWidth + '×' + R.hdEl.naturalHeight); }
+        if (!R.resVal && R.hdNat) { R.resVal = R.hdNat.w + '×' + R.hdNat.h; renderMetaChips(R); }
     }
 
     async function lbLoad (id, thumbSrc, dir) {
@@ -3423,12 +4567,13 @@
         R.baseW = R.baseH = 0; R.baseNat = null;
         R.zoom = 1; R.tx = 0; R.ty = 0;
         R.pts.clear(); R.drag = null; R.pinch = null; R.suppressClick = false;
-        R.hasRes = false; R.data = null; R.hdPath = '';
+        R.resVal = ''; R.data = null; R.hdPath = ''; R.hdNat = null;
         R.dlBusy = false;
         R.hdOn = !!get('hdMode');
         R.hdGen++;
         R.hdTries = 0;
         R.hdState = 'idle';
+        R.hdProc = false; R.hdLblTxt = ''; R.hdLblNext = '';   /* v8.1: every navigation starts the HD bar from a clean slate */
         clearTimeout(R.hdRetryT); R.hdRetryT = 0;
         if (R.pinnedId) { ImagePool.unpin(R.pinnedId); R.pinnedId = null; }
         R.zc.classList.remove('on');
@@ -3457,10 +4602,14 @@
             t.src = thumbSrc;
         }
 
+        /* v7.9.1 — the fresh record is ALWAYS applied when it lands:
+           page-sync/scan seed the cache with partial (tagless)
+           records, and dropping the fresh merge made the first open
+           render without tags until a second click. */
         const meta0 = _meta.get(id) || null;
         const metaP = fetchWallData(id).catch(() => null);
         if (meta0) applyMeta(meta0);
-        else metaP.then(m => { if (m && my === _lbTok) applyMeta(m); });
+        metaP.then(m => { if (m && my === _lbTok) applyMeta(m); });
 
         const previewUrl = (meta0 && meta0.preview) || deriveLarge(id);
         const pv = new Image();
@@ -3477,8 +4626,6 @@
             sizeImg(pv, pv.naturalWidth, pv.naturalHeight, true);
             setLdr(false);
             pv.classList.add(dir > 0 ? 'nx-sw-f' : dir < 0 ? 'nx-sw-b' : 'nx-sw-in');
-            const mres = (meta0 || {}).resolution;
-            if (mres && !R.hasRes) { R.hasRes = true; addChip(mres); }
             prefetchNeighbor(dir >= 0 ? 1 : -1);
             if (R.hdOn && !R.hdEl) hdBegin(R);
         } else {
@@ -3514,10 +4661,13 @@
         const zin  = mk('button'); zin.type = 'button';  zin.innerHTML = IC.plus;  zin.title = 'Zoom in (+)'; zin.setAttribute('aria-label', 'Zoom in');
         const zfit = mk('button'); zfit.type = 'button'; zfit.innerHTML = IC.fit;  zfit.title = 'Fit to screen (0)'; zfit.setAttribute('aria-label', 'Fit to screen');
         const zout = mk('button'); zout.type = 'button'; zout.innerHTML = IC.minus; zout.title = 'Zoom out (−)'; zout.setAttribute('aria-label', 'Zoom out');
+        const z1 = mk('button', 'nx-zc-11'); z1.type = 'button'; z1.textContent = '1:1';
+        z1.title = 'Zoom 1:1 — one image pixel per screen pixel (1)'; z1.setAttribute('aria-label', 'Zoom to native pixels');
         zin.addEventListener('click',  e => { e.stopPropagation(); zoomStep(1.45); });
         zfit.addEventListener('click', e => { e.stopPropagation(); setZoom(1, null, true); });
         zout.addEventListener('click', e => { e.stopPropagation(); zoomStep(1 / 1.45); });
-        zc.append(zpct, zin, zfit, zout);
+        z1.addEventListener('click', e => { e.stopPropagation(); zoomNative(); });
+        zc.append(zpct, zin, zfit, z1, zout);
 
         const bar = mk('div', 'nx-lb-bar');
         const meta = mk('div', 'nx-lb-meta');
@@ -3564,7 +4714,8 @@
             pts: new Map(), drag: null, pinch: null, suppressClick: false, panRaf: false, rsRaf: false,
             hdOn: false, hdGen: 0, hdPath: '',
             hdState: 'idle', hdTries: 0, hdRetryT: 0, hdProgFrac: -1, hdProgRaf: false,
-            pinnedId: null, data: null, hasRes: false, dlBusy: false, bloomSrc: '',
+            hdProc: false, hdLblTxt: '', hdLblNext: '',
+            pinnedId: null, data: null, resVal: '', hdNat: null, dlBusy: false, bloomSrc: '',
         };
         _lbR.cRect = stage.getBoundingClientRect();
 
@@ -3599,6 +4750,28 @@
 
         lbLoad(id, thumbSrc, 0);
     }
+
+    /* ── v7.9.1 hover prime — tags & HD path local before the click ──
+       One passive document-level listener; a 300 ms dwell over a
+       thumbnail fires (at most) the same metadata fetch the click
+       itself would trigger — deduped by the cache, paced by the
+       rate shield, free for anything already fetched. The first
+       open of any wallpaper then carries its tags instantly. */
+    const HOVER_PRIME_MS = 300;
+    let _primeT = 0;
+    document.addEventListener('pointerover', (e) => {
+        clearTimeout(_primeT);
+        const t = e.target;
+        const fig = t && t.closest && t.closest('figure.thumb[data-wallpaper-id]');
+        if (!fig) return;
+        const id = fig.getAttribute('data-wallpaper-id');
+        const m = id && _meta.get(id);
+        if (m && m.tagsFetched === true) return;
+        _primeT = setTimeout(() => {
+            if (!fig.isConnected) return;
+            if (id) fetchWallData(id).catch(() => {});
+        }, HOVER_PRIME_MS);
+    }, { passive: true });
 
     /* ═══ HYPER DOWNLOAD MODE ══════════════════════════════════════ */
 
@@ -3635,18 +4808,51 @@
         DL.add(id);
     }, { capture: true });
 
-    /* ═══ SEARCH HISTORY ══════════════════════════════════════════ */
+    /* ═══ SEARCH HISTORY & JOB LEDGER ════════════════════════════ */
+    /* v7.6.0 — every job records a stable served-id ledger (doneIds),
+       a per-batch ledger, and a live phase, persisted through GM
+       storage so any session survives refreshes and restarts and
+       resumes without ever reprocessing a wallpaper it already
+       served. */
+
+    /* v7.8 — where a page opens: a NEW batch page starts at the very
+       top (Continue / viewing a saved batch); a resumed interrupted
+       batch never moves the user. Smooth, unless reduced-motion. */
+    function nxScrollTop () {
+        try {
+            const w = document.defaultView || (typeof window !== 'undefined' ? window : null);
+            if (!w || typeof w.scrollTo !== 'function') return;
+            const mm = (typeof w.matchMedia === 'function') ? w.matchMedia('(prefers-reduced-motion: reduce)') : null;
+            w.scrollTo({ top: 0, left: 0, behavior: (mm && mm.matches) ? 'auto' : 'smooth' });
+        } catch (e) { try { window.scrollTo(0, 0); } catch (_) {} }
+    }
 
     const HISTORY_INDEX = 'gf_hist_index';
     const BATCH_PREFIX = 'gf_batch_';
-    const BUF_PREFIX   = 'gf_buf_';
+    const BUF_PREFIX   = 'gf_buf_';          /* legacy v7.5 buffers */
+    const JOB_PREFIX   = 'gf_job_';
+    const JOB_DONE_CAP = 12000;              /* max stable ids kept per job */
+    const JOB_LEDGER_CAP = 60;               /* max batch records kept per job */
+    const RANK_TAIL_CAP = 2000;              /* max unserved ranked matches persisted per job */
     const historyLoad = () => { try { return JSON.parse(GM_getValue(HISTORY_INDEX, '[]')); } catch { return []; } };
     const historySave = idx => GM_setValue(HISTORY_INDEX, JSON.stringify(idx));
     const batchLoad = id => { try { return JSON.parse(GM_getValue(BATCH_PREFIX + id, '[]')); } catch { return []; } };
-    const bufLoad   = id => { try { return JSON.parse(GM_getValue(BUF_PREFIX + id, '[]')); } catch { return []; } };
+    const bufLoad   = id => { try { return JSON.parse(GM_getValue(BUF_PREFIX + id, '[]')); } catch { return []; } };   /* v7.6.2: legacy v7.5 buffers */
+    const jobLoad   = id => { try { return JSON.parse(GM_getValue(JOB_PREFIX + id, 'null')) || {}; } catch { return {}; } };
+    const jobSave   = (id, job) => { try { GM_setValue(JOB_PREFIX + id, JSON.stringify(job)); } catch {} };
+    /* v7.7 — per-batch page payloads: every completed batch is
+       persisted under its own key so Settings can open it as its
+       own page, separate from every other batch of the session. */
+    const BPAGE_PREFIX = 'gf_bpage_';
+    const bpageKey  = (id, n) => BPAGE_PREFIX + id + '_' + n;
+    const bpageLoad = (id, n) => { try { return JSON.parse(GM_getValue(bpageKey(id, n), '[]')); } catch { return []; } };
+    function bpageSave (id, n, items) { try { GM_setValue(bpageKey(id, n), JSON.stringify(items.map(slimWall))); } catch {} }
+    function bpageDelete (id, n) { try { GM_deleteValue(bpageKey(id, n)); } catch {} }
     function wipeSessionData (id) {
+        (jobLoad(id).batches || []).forEach(b => { if (b && b.n) bpageDelete(id, b.n); });
         try { GM_deleteValue(BATCH_PREFIX + id); } catch {}
         try { GM_deleteValue(BUF_PREFIX + id); } catch {}
+        try { GM_deleteValue(JOB_PREFIX + id); } catch {}
     }
     const batchDelete = id => { historySave(historyLoad().filter(e => e.id !== id)); wipeSessionData(id); };
     const trimHistory = () => {
@@ -3662,25 +4868,33 @@
                  dimension_x: w.dimension_x, dimension_y: w.dimension_y };
     }
 
-    function sessionSave (sess) {
+    function jobLabel (P) {
+        return (P.query ? '"' + P.query + '" · ' : '') + P.dateFrom + ' → ' + P.dateTo +
+               ' · ♥' + P.minFavs + (P.maxFavsOn ? '–' + P.maxFavs : '+') +
+               ' · ' + (P.sortMode === 'date_added' ? 'new' : 'favs');
+    }
+
+    /* index-only write — used for crash-safe per-page checkpoints.
+       Small (one entry, ~1 KB), never touches item payloads. */
+    function sessionSaveIndex (sess) {
         const P = sess.params;
-        try { GM_setValue(BATCH_PREFIX + sess.id, JSON.stringify(sess.batchItems.map(slimWall))); } catch {}
-        if (sess.mode === 'buffer' && sess.scanned) {
-            const unserved = sess.matches.slice(sess.rank, sess.rank + 600);
-            if (unserved.length) { try { GM_setValue(BUF_PREFIX + sess.id, JSON.stringify(unserved.map(slimWall))); } catch {} }
-            else { try { GM_deleteValue(BUF_PREFIX + sess.id); } catch {} }
-        }
-        const label = P.dateFrom + ' → ' + P.dateTo + ' · ♥' + P.minFavs + (P.maxFavsOn ? '–' + P.maxFavs : '+') +
-                      ' · ' + (P.sortMode === 'date_added' ? 'new' : 'favs') +
-                      (sess.exhausted ? ' · complete' : ' · next #' + sess.batchNum);
-        const state = sess.mode === 'buffer'
-            ? { mode: 'buffer', winTop: sess.winTop, winBot: sess.winBot, rank: sess.rank,
-                batchNum: sess.batchNum, totalFound: sess.rank, exhausted: sess.exhausted }
-            : { mode: 'walk', page: sess.page, itemIdx: sess.itemIdx, lastPage: sess.lastPage,
-                skippedAbove: sess.skippedAbove, batchNum: sess.batchNum, batchFound: sess.batchFound,
-                totalFound: sess.totalFound, consecMisses: sess.consecMisses, exhausted: sess.exhausted };
+        const state = { mode: sess.mode === 'rank' ? 'rank' : 'walk', page: sess.page, itemIdx: sess.itemIdx, lastPage: sess.lastPage,
+                        winTop: sess.winTop || 1, winBot: sess.winBot || 0,
+                        rankCursor: sess.rankCursor || 0, rankScanned: !!sess.rankScanned,
+                        rankCollected: sess.rankCollected || 0, rankRank: sess.rankRank || 0,
+                        rankTotal: sess.rankTotal || 0, rankTailLost: !!sess.rankTailLost,
+                        batchNum: sess.batchNum, batchServed: sess.batchServed || 0, served: sess.served || 0,
+                        skipped: sess.skipped || 0, dupes: sess.dupes || 0, pagesScanned: sess.pagesScanned || 0,
+                        skippedAbove: sess.skippedAbove || 0, consecMisses: sess.consecMisses || 0,
+                        favFloorDone: !!sess.favFloorDone, phase: sess.phase || 'awaiting',
+                        lastServedId: sess.lastServedId || '', lastError: sess.lastError || '',
+                        exhausted: !!sess.exhausted, legacy: !!sess.legacy };
         const entry = {
-            id: sess.id, ts: Date.now(), count: sess.mode === 'buffer' ? sess.rank : sess.totalFound, label: label,
+            id: sess.id, ts: sess.ts || Date.now(), lastTs: Date.now(),
+            name: sess.name || jobLabel(P),
+            count: sess.served || 0,
+            bcount: (sess.batches || []).length,         /* v7.7: batch sub-card badge, no job parse needed */
+            label: jobLabel(P) + (state.phase === 'exhausted' ? ' · complete' : ' · next #' + state.batchNum),
             params: { query: P.query, categories: P.categories, purity: P.purity, atleast: P.atleast, ratios: P.ratios,
                       sortMode: P.sortMode, dateFrom: P.dateFrom, dateTo: P.dateTo,
                       minFavs: P.minFavs, maxFavs: P.maxFavs, maxFavsOn: P.maxFavsOn, batchSize: P.batchSize },
@@ -3694,27 +4908,66 @@
         historySave(idx);
     }
 
+    /* full snapshot — batch end, pause, fatal, exhaustion. Writes the
+       job ledger (stable served ids + batch records) plus the grid
+       batch payload used by History → Load to re-render results. */
+    function sessionSave (sess) {
+        try { GM_setValue(BATCH_PREFIX + sess.id, JSON.stringify(sess.batchItems.map(slimWall))); } catch {}
+        const job = jobLoad(sess.id);
+        job.doneIds = (sess.doneIds && sess.doneIds.size)
+            ? Array.from(sess.doneIds).slice(-JOB_DONE_CAP)
+            : (job.doneIds || []);
+        const allB = (sess.batches && sess.batches.length ? sess.batches : (job.batches || []));
+        if (allB.length > JOB_LEDGER_CAP)                /* v7.7: dropped records take their page payloads with them */
+            allB.slice(0, allB.length - JOB_LEDGER_CAP).forEach(b => { if (b && b.n) bpageDelete(sess.id, b.n); });
+        job.batches = allB.slice(-JOB_LEDGER_CAP);
+        sess.batches = job.batches;                       /* v7.7: the in-memory ledger (and bcount) stay honest with the cap */
+        if (sess.mode === 'rank') {
+            const from = sess.rankScanned ? (sess.rankRank || 0) : 0;
+            if (sess.rankMatches && sess.rankMatches.length - from > RANK_TAIL_CAP) sess.rankTailLost = true;
+            if (!sess.rankScanned && sess.rankTailLost) {          /* partial pool too big to keep — restart collection cleanly */
+                sess.rankMatches = []; sess.rankCollected = 0; sess.rankCursor = sess.winTop || 1; sess.rankTailLost = false;
+            }
+            job.rankTail = (sess.rankMatches || []).slice(from, from + RANK_TAIL_CAP).map(slimWall);
+            job.rankTailLost = !!sess.rankTailLost;
+            job.rankTailAt = sess.rankCursor || 0;
+            job.mode = 'rank';
+        } else {
+            job.rankTail = []; job.rankTailLost = false; job.rankTailAt = 0;
+        }
+        jobSave(sess.id, job);
+        sessionSaveIndex(sess);
+    }
+
+    function sessionCheckpoint (sess) { sess.lastTs = Date.now(); sessionSaveIndex(sess); }
+
     function buildParams (c) {
-        const baseParams = { categories: c.categories, purity: c.purity, sorting: c.sortMode };
+        /* v7.8.1: legacy hot jobs (v7.8.0's client-side ratio rank)
+           resume as new-uploads walks — the served-id ledger still
+           guarantees no wallpaper is ever processed twice. */
+        const sm = c.sortMode === 'hot' ? 'date_added' : c.sortMode;
+        const baseParams = { categories: c.categories, purity: c.purity, sorting: sm };
         if (c.query)   baseParams.q = c.query;
         if (c.atleast) baseParams.atleast = c.atleast;
         if (c.ratios)  baseParams.ratios = c.ratios;
         return { baseParams: baseParams, query: c.query, categories: c.categories, purity: c.purity, atleast: c.atleast, ratios: c.ratios,
-                 sortMode: c.sortMode, dateFrom: c.dateFrom, dateTo: c.dateTo,
+                 sortMode: sm, dateFrom: c.dateFrom, dateTo: c.dateTo,
                  minFavs: c.minFavs, maxFavs: c.maxFavs, maxFavsOn: c.maxFavsOn, batchSize: c.batchSize };
     }
 
     function restoreSearchSettings (c) {
         const i = UI.inputs;
-        i.q.value = c.query || ''; i.sort.value = c.sortMode;
+        i.q.value = c.query || '';
+        i.sort.value = c.sortMode === 'hot' ? 'date_added' : c.sortMode;   /* v7.8.1: the hot option is gone — legacy jobs land on new uploads */
         i.dfrom.value = c.dateFrom; i.dto.value = c.dateTo;
         i.minf.value = c.minFavs; i.maxf.value = c.maxFavs || 0;
         i.res.value = c.atleast || ''; i.rat.value = c.ratios || '';
+        i.bs.value = c.batchSize || 200;
         setChips(UI.chips.cat, c.categories || '111');
         setChips(UI.chips.pur, c.purity || '100');
         UI.maxon.classList.toggle('on', !!c.maxFavsOn);
         UI.maxon.setAttribute('aria-pressed', !!c.maxFavsOn);
-        set('query', c.query || ''); set('sortMode', c.sortMode);
+        set('query', c.query || ''); set('sortMode', c.sortMode === 'hot' ? 'date_added' : c.sortMode);
         set('dateFrom', c.dateFrom); set('dateTo', c.dateTo);
         set('minFavs', c.minFavs); set('maxFavs', c.maxFavs || 0); set('maxFavsOn', !!c.maxFavsOn);
         set('atleast', c.atleast || ''); set('ratios', c.ratios || '');
@@ -3722,59 +4975,140 @@
         refreshMaxFavUI(); markFavRange(); validateDates();
     }
 
-    function loadHistoryEntry (entry) {
-        const data = batchLoad(entry.id);
+    function loadHistoryEntry (entry, batchN) {
+        if (_running) { setStatus('✕ Pause the scan before loading a history entry.', true); return; }
+        const fresh = historyLoad().find(e => e.id === entry.id);      /* v7.7: always restore the LATEST saved state, never a stale closure */
+        if (fresh) entry = fresh;
+        const data = batchN ? batchPagePayload(entry, batchN) : batchLoad(entry.id);
         renderBatch(data);
+        _gridPage = entry.id + '#' + (batchN || (entry.state && entry.state.batchNum) || 1);   /* v7.7: which page the grid is showing */
         if (entry.params && entry.state) {
             restoreSearchSettings(entry.params);
             const st = entry.state;
-            if (st.mode === 'buffer') {
-                const buf = bufLoad(entry.id);
-                _session = { id: entry.id, params: buildParams(entry.params), mode: 'buffer',
-                             winTop: st.winTop || 1, winBot: st.winBot || 1, scanPage: st.winTop || 1,
-                             matches: buf, collectedIds: new Set(), scanned: buf.length > 0,
-                             rank: buf.length ? 0 : (st.rank || 0),
-                             batchNum: st.batchNum || 1, batchFound: 0,
-                             totalFound: st.totalFound || st.rank || data.length, consecMisses: 0, skippedAbove: 0,
-                             page: 1, itemIdx: 0, lastPage: 1, winBotSaved: 0, favFloorDone: false,
-                             exhausted: !!st.exhausted, batchItems: data };
+            const legacy = st.mode === 'buffer' || !!st.legacy || !('phase' in st);
+            const job = jobLoad(entry.id);
+            const doneIds = new Set(job.doneIds || []);
+            if (!doneIds.size) for (const w of data) doneIds.add(String(w.id));
+            const P = buildParams(entry.params);
+            const rankMode = !legacy && st.mode === 'rank';
+            const tailStale = rankMode && !st.rankScanned && job.rankTailAt !== st.rankCursor;
+            _session = { id: entry.id, params: P, ts: entry.ts || Date.now(),
+                         name: entry.name || jobLabel(P), mode: rankMode ? 'rank' : 'walk',
+                         phase: legacy ? 'legacy' : (st.phase === 'collecting' ? 'paused' : (st.phase || (st.exhausted ? 'exhausted' : 'awaiting'))),
+                         page: legacy ? 1 : (st.page || 1), itemIdx: legacy ? 0 : (st.itemIdx || 0),
+                         lastPage: st.lastPage || 1, winTop: st.winTop || 1, winBot: st.winBot || 0, favFloorDone: !!st.favFloorDone,
+                         batchNum: st.batchNum || 1, batchServed: legacy ? 0 : (st.batchServed || 0),
+                         served: st.served || st.totalFound || data.length,
+                         skipped: st.skipped || 0, dupes: st.dupes || 0,
+                         pagesScanned: st.pagesScanned || 0, skippedAbove: st.skippedAbove || 0,
+                         consecMisses: st.consecMisses || 0,
+                         exhausted: !!st.exhausted, legacy: legacy,
+                         lastServedId: st.lastServedId || '', lastError: st.lastError || '',
+                         cursorVerified: false, batches: job.batches || [],
+                         rankCursor: tailStale ? (st.winTop || 1) : (st.rankCursor || 0),
+                         rankScanned: rankMode && !!st.rankScanned,
+                         rankCollected: tailStale ? 0 : (st.rankCollected || 0),
+                         rankRank: rankMode ? 0 : (st.rankRank || 0),
+                         rankTotal: st.rankTotal || 0, rankTailLost: !!job.rankTailLost,
+                         rankMatches: rankMode ? (tailStale ? [] : (job.rankTail || [])) : [],
+                         doneIds: doneIds,
+                         batchItems: (!legacy && st.batchServed > 0) ? batchLoad(entry.id) : [],   /* v7.7: the live partial seeds the next payload, never a viewed page */
+                         pageCache: new Map() };
+            _seenIds = new Set(_session.doneIds);
+            setCount(data.length);                   /* v7.7: the pill counts the page on screen */
+            renderJobStrip();
+            if (_session.phase === 'exhausted') {
+                setContBar('done', 'No more results', _session.served.toLocaleString() + ' collected');
+            } else if (legacy) {
+                setContBar('go', 'Continue — recover unserved matches (v7.6.2 engine)',
+                           'old buffered session · the ranked window takes over');
+            } else if (rankMode && !_session.rankScanned) {
+                setContBar('go', 'Continue — collect window',
+                           'resumes at page ' + _session.rankCursor + '/' + Math.max(1, _session.winBot - 1));
             } else {
-                _session = { id: entry.id, params: buildParams(entry.params), mode: 'walk',
-                             page: st.page, itemIdx: st.itemIdx, lastPage: st.lastPage || 1,
-                             skippedAbove: st.skippedAbove || 0, winBot: 0, favFloorDone: true,
-                             batchNum: st.batchNum || 1, batchFound: st.batchFound || 0,
-                             totalFound: st.totalFound || data.length, consecMisses: st.consecMisses || 0,
-                             exhausted: !!st.exhausted, batchItems: data,
-                             winTop: 1, scanPage: 1, matches: [], collectedIds: new Set(), rank: 0, scanned: false };
-            }
-            _seenIds = new Set();
-            for (const f of document.querySelectorAll('figure.thumb[data-wallpaper-id]')) {
-                const id = f.getAttribute('data-wallpaper-id'); if (id) _seenIds.add(id);
-            }
-            setCount(_session.totalFound || data.length);
-            if (_session.exhausted) {
-                setContBar('done', 'No more results', (_session.totalFound || 0).toLocaleString() + ' collected');
-            } else if (_session.mode === 'buffer') {
-                setContBar('go', _session.scanned
-                    ? 'Continue — next ' + entry.params.batchSize + ' (instant)'
-                    : 'Continue — collect window',
-                    'resumes at page ' + _session.scanPage);
-            } else {
-                const left = Math.max(0, entry.params.batchSize - _session.batchFound);
-                setContBar('go', _session.batchFound
-                    ? 'Continue — finish batch ' + _session.batchNum + ' (' + left + ' left)'
+                const left = Math.max(0, entry.params.batchSize - _session.batchServed);
+                setContBar('go', _session.phase === 'paused' || _session.phase === 'error'
+                    ? 'Resume — finish batch ' + _session.batchNum + ' (' + left + ' left)'
                     : 'Continue — batch ' + _session.batchNum,
-                    'resumes at page ' + _session.page);
+                    rankMode
+                        ? (_session.rankMatches.length + ' ranked matches ready · instant')
+                        : ('resumes at page ' + _session.page + (_session.phase === 'error' ? ' · retries the error' : '')));
             }
-            setStatus('History restored · Continue resumes the scan — or change filters and press Search for a fresh one');
+            setStatus(legacy
+                ? 'Loaded a v7.5 buffered session · Continue recovers its unserved matches with the v7.6.2 ranked-window engine — wallpapers already on screen are excluded'
+                : 'History restored · Continue resumes the saved cursor — or Restart to process the job from the beginning');
         } else {
             _session = null;
+            renderJobStrip();
             setContBar('none', '', '');
-            setStatus('✓ Loaded batch: ' + entry.label);
+            setStatus('✓ Loaded batch: ' + (entry.label || entry.name || ''));
         }
         refreshHistoryPanel();
     }
 
+    /* v7.7 — open one completed batch as its own page: the grid
+       shows exactly that batch's wallpapers (a separate page, not
+       a continuous stream), while the session's cursor, ledger and
+       resume state stay completely untouched.
+       v8.1 — the LIVE in-progress batch is a page too: its
+       crash-safe partial (written at every checkpoint) is its
+       payload, so Forward can hand you back the live page after a
+       Back, and it is exactly what is on it so far. */
+    function batchPagePayload (entry, n) {
+        let d = bpageLoad(entry.id, n);
+        if (!d.length && entry.state && entry.state.batchNum === n && (entry.state.batchServed || 0) > 0)
+            d = batchLoad(entry.id);          /* the live batch's checkpointed partial */
+        return d;
+    }
+    function viewJobBatch (entry, n) {
+        if (_running) { setStatus('✕ Pause the scan before viewing a batch page.', true); return; }
+        const fresh = historyLoad().find(e => e.id === entry.id);      /* always the LATEST saved state, never a stale closure */
+        if (fresh) entry = fresh;
+        const payload = batchPagePayload(entry, n);
+        if (!payload.length) { setStatus('✕ Batch #' + n + ' has no saved page (created by an older engine version).', true); return; }
+        loadHistoryEntry(entry, n);
+        nxScrollTop();                                    /* v7.8: a batch page opens at the top */
+        setStatus('Viewing batch #' + n + ' · ' + payload.length.toLocaleString() + ' wallpapers · this batch only — Continue returns to the live session page');
+    }
+
+    const PHASE_TXT = { running: 'scanning', collecting: 'collecting window', awaiting: 'awaiting next batch', paused: 'paused',
+                        sparse: 'sparse — deep scan ready', exhausted: 'complete',
+                        error: 'error — retry ready', legacy: 'v7.5 session' };
+    function fmtAgo (ts) {
+        if (!ts) return '';
+        const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
+        if (s < 60) return 'just now';
+        if (s < 3600) return Math.floor(s / 60) + 'm ago';
+        if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+        return Math.floor(s / 86400) + 'd ago';
+    }
+
+    /* v7.7 — session cards expand into per-batch sub-cards. Each
+       completed batch is a sub-card; "View" opens it as its own
+       page. Toggles are remembered for the tab's lifetime, and the
+       active session starts expanded so its batches are visible
+       while the job runs. */
+    let _histUser = new Map();
+    function histOpen (id) {
+        return _histUser.has(id) ? _histUser.get(id) === 'open' : !!(_session && _session.id === id);
+    }
+    function buildBatchSubCards (sub, entry) {
+        const batches = (jobLoad(entry.id).batches || []).filter(b => b && b.n && b.count > 0);
+        for (const b of batches.slice().reverse()) {          /* newest batch first */
+            const bc = mk('div', 'nx-hist-batch');
+            const bn = mk('span', 'nx-hist-batch-n');
+            bn.textContent = '#' + b.n;
+            const bm = mk('span', 'nx-hist-batch-meta');
+            bm.textContent = (b.count || 0).toLocaleString() + ' wallpapers · ' + fmtAgo(b.ts) +
+                             (b.final ? ' · final' : '');
+            const bv = mk('button', 'nx-btn nx-btn-dim');
+            bv.type = 'button'; bv.textContent = 'View';
+            bv.title = 'Open batch #' + b.n + ' as its own page — only this batch\u2019s wallpapers';
+            bv.addEventListener('click', () => viewJobBatch(entry, b.n));
+            bc.append(bn, bm, bv);
+            sub.appendChild(bc);
+        }
+    }
     function refreshHistoryPanel () {
         const host = document.getElementById('nx-hist'); if (!host) return;
         const idx = historyLoad();
@@ -3784,16 +5118,69 @@
             host.appendChild(e); return;
         }
         for (const entry of idx) {
+            const nb = entry.bcount != null ? entry.bcount : (jobLoad(entry.id).batches || []).length;
+            const open = histOpen(entry.id) && nb > 0;
+            const item = mk('div', 'nx-hist-item' + (open ? ' nx-open' : ''));
             const row = mk('div', 'nx-hist-row');
-            const l = mk('span', 'nx-hist-label'); l.textContent = entry.label; l.title = entry.label;
-            const c = mk('span', 'nx-hist-count'); c.textContent = entry.count + ' collected';
+            const tw = mk('button', 'nx-hist-tw');
+            tw.type = 'button'; tw.disabled = !nb;
+            tw.title = nb ? 'Show / hide this session\u2019s saved batches' : 'No batches saved yet';
+            tw.setAttribute('aria-expanded', String(open));
+            tw.innerHTML = (nb ? '<b>' + nb + '</b>' : '') + IC.chev;
+            const main = mk('div', 'nx-hist-main');
+            const l = mk('span', 'nx-hist-label');
+            l.textContent = entry.name || entry.label || ('job ' + entry.id);
+            l.title = entry.label || l.textContent;
+            const st = entry.state || {};
+            const meta = mk('span', 'nx-hist-meta');
+            const phase = st.phase || (st.exhausted ? 'exhausted' : 'awaiting');
+            meta.textContent = (entry.count || 0) + ' served · batch ' + (st.batchNum || 1) +
+                               (st.batchServed ? ' (' + st.batchServed + ' in progress)' : '') +
+                               ((st.skipped || 0) ? ' · ' + st.skipped + ' skipped' : '') +
+                               (st.lastError ? ' · ' + st.lastError.slice(0, 40) : '') +
+                               ' · ' + (PHASE_TXT[phase] || phase) + ' · ' + fmtAgo(entry.lastTs || entry.ts);
+            const btns = mk('span', 'nx-hist-btns');
             const bl = mk('button', 'nx-btn nx-btn-dim'); bl.type = 'button'; bl.textContent = 'Load';
-            const bd = mk('button', 'nx-btn nx-btn-dim nx-hist-x'); bd.type = 'button'; bd.innerHTML = IC.x; bd.title = 'Delete';
+            bl.title = 'Inspect results & resume this job';
+            const br = mk('button', 'nx-btn nx-btn-dim nx-hist-ib'); br.type = 'button'; br.innerHTML = IC.retry;
+            br.title = 'Restart this job from the beginning (new history entry)';
+            const bd = mk('button', 'nx-btn nx-btn-dim nx-hist-x'); bd.type = 'button'; bd.innerHTML = IC.x;
+            bd.title = 'Delete this job and its data';
             bl.addEventListener('click', () => loadHistoryEntry(entry));
-            bd.addEventListener('click', () => { batchDelete(entry.id); if (_session && _session.id === entry.id) _session = null; refreshHistoryPanel(); });
-            row.append(l, c, bl, bd);
-            host.appendChild(row);
+            br.addEventListener('click', () => restartJob(entry));
+            bd.addEventListener('click', () => {
+                batchDelete(entry.id);
+                if (_session && _session.id === entry.id) { _session = null; _gridPage = null; renderJobStrip(); }
+                syncBackBtn(); syncFwdBtn();          /* v8.1: the arrows follow the live page tag */
+                refreshHistoryPanel();
+            });
+            btns.append(bl, br, bd);
+            main.append(l, meta);
+            row.append(tw, main, btns);
+            item.appendChild(row);
+            if (nb) {
+                const sub = mk('div', 'nx-hist-sub');
+                sub.hidden = !open;
+                if (open) buildBatchSubCards(sub, entry);
+                tw.addEventListener('click', () => {
+                    const to = sub.hidden;                    /* flip */
+                    sub.hidden = !to;
+                    _histUser.set(entry.id, to ? 'open' : 'closed');
+                    tw.setAttribute('aria-expanded', String(to));
+                    item.classList.toggle('nx-open', to);
+                    if (to && !sub.childNodes.length) buildBatchSubCards(sub, entry);
+                });
+                item.appendChild(sub);
+            }
+            host.appendChild(item);
         }
+    }
+
+    function restartJob (entry) {
+        if (_running) { setStatus('✕ Pause the scan before restarting a job.', true); return; }
+        if (!entry.params) return;
+        restoreSearchSettings(entry.params);
+        runSearch();
     }
 
     /* ═══ CARD BUILDER & GRID HELPERS ══════════════════════════════ */
@@ -3876,6 +5263,8 @@
         const ul = getUL(); if (!ul) return;
         setContBar('none', '', '');
         _session = null;
+        _gridPage = null;
+        renderJobStrip();
         ensureSnapshot();
         if (_nativeItems && _nativeItems.length) {
             ul.textContent = '';
@@ -3905,23 +5294,59 @@
         setStatus(n > 0 ? 'Reloading ' + n + ' thumbnail' + (n !== 1 ? 's' : '') + '…' : 'All thumbnails look loaded.');
     }
 
-    /* ═══ SCAN ENGINE ════════════════════════════════════════════ */
+    /* ═══ SCAN ENGINE — v7.6 TRUE BATCH ════════════════════════════ */
+    /* Two complementary strategies, both batch-first:
+       · WALK — date order, or favorites order without a date
+         window. The walk itself is the result sequence, so only
+         the pages each batch needs are fetched and it stops
+         mid-page with a resumable cursor.
+       · RANKED WINDOW — favorites order inside a date window. The
+         favorites index interleaves every date, so a window is
+         sparse there; instead the contiguous window is collected
+         once in upload order (every page in range — the minimum
+         possible discovery), ranked by ♥, and each batch serves
+         the top N instantly from memory. Sampling picks the
+         cheaper strategy when the window is large.
+       Both keep the persistent served-id ledger, per-page
+       crash-safe checkpoints and one-time source-shift detection,
+       so every job resumes without duplicate work. */
 
     const MAX_CONSEC_MISS = 50;
     const MAX_SAFE_PAGE = 4000;
     const SCAN_RETRIES = 3;
-    const BUFFER_MAX_PAGES = 2500;
-    const WALK_EST_MAX = 600;
+    const PAGE_CACHE_MAX = 16;                 /* walked/prefetched pages kept per job */
+    const BUFFER_MAX_PAGES = 2500;             /* windows larger than this are walked, not ranked */
+    const WALK_EST_MAX = 600;                  /* walk preferred when it needs at most this many pages per batch */
 
     let _running = false, _stop = false;
     let _seenIds = new Set();
     let _session = null;
+    let _gridPage = null;              /* v7.7: which job#batch page the grid is currently showing */
+
+    function phaseLabel (ph) {
+        return PHASE_TXT[ph] || ph || 'idle';
+    }
+
+    /* ── v7.7.3 UNIFIED RATE SHIELD (engine side) ───────────────────
+       The gate itself — one rolling window for EVERY request the
+       script sends to wallhaven.cc — lives in the NETWORK LAYER, so
+       scan pages, wallpaper metadata, page-sync and the HTML fallback
+       all share one budget. The engine keeps only the recovery ladder:
+       a 429/403 is waited out with an exponential backoff that honors
+       the server's own Retry-After, never a fatal. */
+    const RL_RETRIES   = 6;               /* 403/429 ladder: 2s, 4s, 8s, 16s, 32s, 64s */
+    const RL_WAIT_BASE = 2000;
 
     async function scanFetch (P, page) {
-        let attempt = 0;
+        let attempt = 0, rl = 0;
         for (;;) {
             if (_stop) return { stopped: true };
-            const resp = await apiSearch({ ...P.baseParams, page: page });
+            /* v7.7.3: the gate guards the network layer — the engine
+               requests its slot itself (pause beats pacing) and marks
+               the call preGated so apiRaw does not count it twice. */
+            if ((await paceGate(() => _stop)) === 'stopped') return { stopped: true };
+            const resp = await apiSearch({ ...P.baseParams, page: page }, { preGated: true });
+            if (resp._httpError === -3) return { stopped: true };   /* gate abort on pause */
             if (resp.error) {
                 const msg = String(resp.error).toLowerCase().includes('key') ? '✕ Invalid API key.' : '✕ API: ' + resp.error;
                 return { fatal: true, msg: msg };
@@ -3935,75 +5360,246 @@
                 return { data: resp.data, meta: resp.meta };
             }
             const code = resp._httpError;
-            const transient = (code === 429 || code >= 500 || code === -1 || code === -2 || code === 0);
+            /* v7.7.3 — 403/429 = Wallhaven's rate limit. NEVER a reason
+               to die: back off exponentially (2s -> 64s, past a full
+               limit window), honor the server's own Retry-After, and
+               retry the page automatically. */
+            if ((code === 403 || code === 429) && rl < RL_RETRIES) {
+                rl++;
+                const wait = Math.max(RL_WAIT_BASE << (rl - 1), resp._retryAfter ? resp._retryAfter * 1000 + 250 : 0);
+                setStatus('⏳ Rate limit (' + code + ') — auto-retry in ' + Math.round(wait / 1000) + 's (' + rl + '/' + RL_RETRIES + ')…');
+                try { GM_setValue('gf_rl_until', String(Date.now() + 60000)); } catch (e) {}
+                await sleep(wait);
+                continue;
+            }
+            const transient = (code >= 500 || code === -1 || code === -2 || code === 0);
             if (transient && attempt < SCAN_RETRIES) {
                 attempt++;
                 setStatus('⚠ API hiccup (' + code + ') · retry ' + attempt + '/' + SCAN_RETRIES + '…');
                 await sleep(900 * attempt);
                 continue;
             }
-            return { fatal: true, msg: code >= 500 ? '✕ Wallhaven server limit — state saved, Continue retries.' : '✕ API error ' + code };
+            return { fatal: true, msg:
+                (code === 403 || code === 429) ? '✕ API rate limit — state saved; press Continue to retry (the limit resets within a minute).' :
+                code >= 500 ? '✕ Wallhaven server limit — state saved, Continue retries.' : '✕ API error ' + code };
         }
     }
 
-    async function findDateStartPage (P, targetDate, lastPage) {
+    /* page fetch with a small per-job cache — enables one-page-ahead
+       prefetch without extra requests and never refetches a page the
+       cursor already passed. v7.6.2: keys are sorting-aware, so
+       date-window locator probes, rank-mode collection pages and the
+       walk's own pages each cache in their own lane — and pages the
+       binary search already probed are REUSED by the collection
+       instead of fetched twice. In-flight promises are cached too, so
+       overlapping calls for the same page share one request. */
+    function cachedPage (sess, page, P) {
+        const key = (((P || sess.params).baseParams || {}).sorting || '') + page;
+        const hit = sess.pageCache.get(key);
+        if (hit) return Promise.resolve(hit);
+        const p = scanFetch(P || sess.params, page).then(r => {
+            if (r && r.data && !r.stopped && !r.fatal) {
+                if (sess.pageCache.size >= PAGE_CACHE_MAX) {
+                    for (const k of sess.pageCache.keys()) { if (k !== key) { sess.pageCache.delete(k); break; } }
+                }
+            } else if (sess.pageCache.get(key) === p) {
+                sess.pageCache.delete(key);      /* don't cache stop/fail results */
+            }
+            return r;
+        });
+        p.catch(() => { if (sess.pageCache.get(key) === p) sess.pageCache.delete(key); });   /* v7.6.2: a rejected fetch is retried, never wedges the cache */
+        sess.pageCache.set(key, p);
+        return p;
+    }
+    function prefetch (sess, page) { cachedPage(sess, page).catch(() => {}); }
+
+    /* v7.7.1 — the Continue pill FLOATS: fixed to the viewport,
+       bottom-center, always on screen — one tap, zero scrolling.
+       v8.1 — it also carries Back and Forward: viewing a batch page
+       gets a one-tap return to the previous batch's saved page and a
+       one-tap jump to the next saved one, without ever touching the
+       live session's cursor. */
+    const CONT_DONE_TTL = 6000;
+    function setContBar (mode, label, note) {
+        let bar = document.getElementById('nx-cont-bar');
+        if (mode === 'none') { dismissContBar(); return; }
+        if (!bar) {
+            bar = mk('div', 'nx-cont-bar'); bar.id = 'nx-cont-bar';
+            bar.setAttribute('role', 'status');
+            bar.setAttribute('aria-live', 'polite');
+            const bk = mk('button', 'nx-btn nx-back-btn'); bk.type = 'button';
+            bk.addEventListener('click', () => {
+                const t = backTarget(); if (!t) return;
+                viewJobBatch(t.entry, t.n);
+            });
+            const fw = mk('button', 'nx-btn nx-fwd-btn'); fw.type = 'button';
+            fw.addEventListener('click', () => {
+                const t = fwdTarget(); if (!t) return;
+                viewJobBatch(t.entry, t.n);
+            });
+            const b = mk('button', 'nx-btn nx-cont-btn'); b.type = 'button';
+            b.addEventListener('click', () => { if (!_running) continueSearch(); });
+            bar.append(bk, fw, b, mk('span', 'nx-cont-note'));
+            document.body.appendChild(bar);     /* body-level fixed pill — independent of the grid */
+            requestAnimationFrame(() => { if (bar.isConnected) bar.classList.add('on'); });
+        } else {
+            if (bar._t) { clearTimeout(bar._t); bar._t = 0; }   /* a new state cancels any pending fade-out */
+            bar.classList.add('on');            /* revive a mid-fade pill instantly — no invisible zombies */
+        }
+        const btn = bar.querySelector('.nx-cont-btn');
+        const noteEl = bar.querySelector('.nx-cont-note');
+        bar.classList.toggle('nx-done', mode === 'done');
+        btn.classList.toggle('nx-loading', mode === 'load');
+        btn.disabled = mode !== 'go';
+        btn.innerHTML = (mode === 'load' ? IC.sync : mode === 'done' ? IC.ok : IC.play) +
+                        '<span>' + (label || (mode === 'done' ? 'No more results' : 'Continue')) + '</span>';
+        noteEl.textContent = note || '';
+        noteEl.hidden = !note;                  /* no empty flex-gap slot when noteless */
+        if (mode === 'done') bar._t = setTimeout(() => dismissContBar(), CONT_DONE_TTL);
+        syncBackBtn();
+        syncFwdBtn();                 /* v8.1: the arrows follow the page tag live too */
+    }
+
+    /* v8.1 — where does Back go? The grid page tag ("job#batch") plus
+       the ledger decide: the previous batch page of the SAME job, read
+       from its saved payload. Never offered mid-scan, never when the
+       payload is missing, never at batch #1. */
+    function backTarget () {
+        if (_running) return null;
+        const m = _gridPage ? String(_gridPage).split('#') : null;
+        if (!m || m.length !== 2) return null;
+        const n = parseInt(m[1], 10) || 0;
+        if (n <= 1) return null;
+        const entry = historyLoad().find(e => e.id === m[0]);
+        if (!entry) return null;
+        return { entry: entry, n: n - 1 };
+    }
+    function syncBackBtn () {
+        const bar = document.getElementById('nx-cont-bar');
+        if (!bar) return;
+        const bk = bar.querySelector('.nx-back-btn');
+        if (!bk) return;
+        const t = backTarget();
+        bk.hidden = !t;
+        if (!t) { bk.disabled = true; return; }
+        bk.disabled = false;
+        const lbl = 'Batch ' + t.n;
+        if (bk._lbl !== lbl) {
+            bk._lbl = lbl;
+            bk.innerHTML = IC.left + '<span>' + lbl + '</span>';
+            bk.title = 'Open batch ' + t.n + ' as its own page — the live session cursor is untouched';
+            bk.setAttribute('aria-label', 'Back to batch ' + t.n);
+        }
+    }
+
+    /* v8.1 — and Forward, Back's mirror: the next SAVED batch page of
+       the same job, payload straight from the ledger (or the live
+       in-progress batch's crash-safe partial). Never offered
+       mid-scan, never past what exists — from the newest page,
+       Continue serves the future instead. */
+    function fwdTarget () {
+        if (_running) return null;
+        const m = _gridPage ? String(_gridPage).split('#') : null;
+        if (!m || m.length !== 2) return null;
+        const n = parseInt(m[1], 10) || 0;
+        if (n < 1) return null;
+        const entry = historyLoad().find(e => e.id === m[0]);
+        if (!entry) return null;
+        const nxt = n + 1;
+        const saved = (jobLoad(entry.id).batches || []).some(b => b && b.n === nxt && b.count > 0);
+        const liveNext = !saved && entry.state && entry.state.batchNum === nxt && (entry.state.batchServed || 0) > 0;
+        return (saved || liveNext) ? { entry: entry, n: nxt } : null;
+    }
+    function syncFwdBtn () {
+        const bar = document.getElementById('nx-cont-bar');
+        if (!bar) return;
+        const fw = bar.querySelector('.nx-fwd-btn');
+        if (!fw) return;
+        const t = fwdTarget();
+        fw.hidden = !t;
+        if (!t) { fw.disabled = true; return; }
+        fw.disabled = false;
+        const lbl = 'Batch ' + t.n;
+        if (fw._lbl !== lbl) {
+            fw._lbl = lbl;
+            fw.innerHTML = IC.right + '<span>' + lbl + '</span>';
+            fw.title = 'Open batch ' + t.n + ' as its own page — the live session cursor is untouched';
+            fw.setAttribute('aria-label', 'Forward to batch ' + t.n);
+        }
+    }
+    function dismissContBar () {
+        const bar = document.getElementById('nx-cont-bar');
+        if (!bar) return;
+        if (bar._t) { clearTimeout(bar._t); bar._t = 0; }
+        bar.classList.remove('on');             /* graceful fade — a fresh state can still revive it */
+        setTimeout(() => { if (!bar.classList.contains('on') && bar.isConnected) bar.remove(); }, 220);
+    }
+
+    async function findDateStartPage (sess, P, targetDate, lastPage) {
         let lo = 1, hi = Math.min(lastPage + 1, MAX_SAFE_PAGE + 1), calls = 0;
         while (lo < hi) {
             const mid = (lo + hi) >> 1; calls++;
             setStatus('Locating ' + targetDate + ' · probe ' + calls + ' (page ' + mid + ')');
             await sleep(80);
-            const r = (mid > lastPage) ? { done: true } : await scanFetch(P, mid);
+            const r = (mid > lastPage) ? { done: true } : await cachedPage(sess, mid, P);
             if (r.fatal) return -1;
-            if (r.done || r.stopped || !r.data.length) { hi = mid; continue; }
+            if (r.stopped) return -2;
+            if (r.done || !r.data.length) { hi = mid; continue; }
             if ((r.data[0].created_at || '').slice(0, 10) > targetDate) lo = mid + 1; else hi = mid;
         }
         return lo;
     }
-    async function findDateEndPage (P, targetDate, lastPage) {
+    async function findDateEndPage (sess, P, targetDate, lastPage) {
         let lo = 1, hi = Math.min(lastPage + 1, MAX_SAFE_PAGE + 1), calls = 0;
         while (lo < hi) {
             const mid = (lo + hi) >> 1; calls++;
             setStatus('Locating ' + targetDate + ' floor · probe ' + calls + ' (page ' + mid + ')');
             await sleep(80);
-            const r = (mid > lastPage) ? { done: true } : await scanFetch(P, mid);
+            const r = (mid > lastPage) ? { done: true } : await cachedPage(sess, mid, P);
             if (r.fatal) return -1;
-            if (r.done || r.stopped || !r.data.length) { hi = mid; continue; }
+            if (r.stopped) return -2;
+            if (r.done || !r.data.length) { hi = mid; continue; }
             if ((r.data[0].created_at || '').slice(0, 10) < targetDate) hi = mid; else lo = mid + 1;
         }
         return lo;
     }
-    async function findFavsFloorPage (P, minFavs, lastPage) {
+    async function findFavsFloorPage (sess, P, minFavs, lastPage) {
         let lo = 1, hi = Math.min(lastPage + 1, MAX_SAFE_PAGE + 1), calls = 0;
         while (lo < hi) {
             const mid = (lo + hi) >> 1; calls++;
             setStatus('Locating ♥' + minFavs.toLocaleString() + ' floor · probe ' + calls + ' (page ' + mid + ')');
             await sleep(80);
-            const r = (mid > lastPage) ? { done: true } : await scanFetch(P, mid);
+            const r = (mid > lastPage) ? { done: true } : await cachedPage(sess, mid, P);
             if (r.fatal) return -1;
-            if (r.done || r.stopped || !r.data.length) { hi = mid; continue; }
+            if (r.stopped) return -2;
+            if (r.done || !r.data.length) { hi = mid; continue; }
             if (r.data[0].favorites >= minFavs) lo = mid + 1; else hi = mid;
         }
         return lo;
     }
-    async function findFavsStartPage (P, maxFavs, lastPage) {
+    async function findFavsStartPage (sess, P, maxFavs, lastPage) {
         let lo = 1, hi = Math.min(lastPage, MAX_SAFE_PAGE), calls = 0;
         while (lo < hi) {
             const mid = (lo + hi) >> 1; calls++;
             setStatus('Locating ♥' + maxFavs.toLocaleString() + ' · probe ' + calls + ' (page ' + mid + ')');
             await sleep(80);
-            const r = await scanFetch(P, mid);
+            const r = await cachedPage(sess, mid, P);
             if (r.fatal) return -1;
-            if (r.done || r.stopped || !r.data.length) { hi = mid; continue; }
+            if (r.stopped) return -2;
+            if (r.done || !r.data.length) { hi = mid; continue; }
             if (r.data[0].favorites > maxFavs) lo = mid + 1; else hi = mid;
         }
         return lo;
     }
 
-    async function sampleDensity (P, region) {
+
+    /* two probes estimate how dense the window is in the
+       favorites-ordered index — decides walk vs ranked window. */
+    async function sampleDensity (sess, P, region) {
         let hits = 0, pages = 0;
         for (const frac of [0.5, 0.8]) {
             const pg = Math.max(1, Math.min(Math.round(region * frac), MAX_SAFE_PAGE));
-            const r = await scanFetch(P, pg);
+            const r = await cachedPage(sess, pg, P);
             if (r.fatal || r.done || r.stopped || !r.data) continue;
             pages++;
             for (const w of r.data) {
@@ -4017,13 +5613,16 @@
 
     function abortStart (msg) {
         _running = false; setRunningUI(false);
+        scanBarResolve();               /* v8.1: no terminal leaves the bar mid-flight */
         setStatus(msg, true);
         setContBar('go', 'Continue — retry scan', '');
+        if (_session) { _session.phase = 'error'; _session.lastError = msg; renderJobStrip(); }
     }
-
     function emptyWindow (sess) {
         _running = false; setRunningUI(false);
-        sess.exhausted = true;
+        scanBarResolve();               /* v8.1 */
+        sess.exhausted = true; sess.phase = 'exhausted';
+        sessionSave(sess);
         const ul = getUL();
         if (ul) {
             const li = mk('li', 'nx-empty');
@@ -4032,173 +5631,328 @@
         }
         setContBar('done', 'No more results', 'empty range · no scanning needed');
         setStatus('✓ Empty range — verified via date boundaries in a couple dozen requests');
+        renderJobStrip(); refreshHistoryPanel();
     }
     function maxFavsEmpty (sess) {
         _running = false; setRunningUI(false);
-        sess.exhausted = true;
+        scanBarResolve();               /* v8.1 */
+        sess.exhausted = true; sess.phase = 'exhausted';
+        sessionSave(sess);
         setStatus('⚠ Max ♥ starts below the favorites floor — no results. Raise Max ♥ or lower Min ♥.');
         setContBar('done', 'No more results', '');
+        renderJobStrip(); refreshHistoryPanel();
     }
 
     async function prepareFavsWalk (sess) {
         const P = sess.params;
         if (P.minFavs > 0 && !sess.favFloorDone) {
-            const floor = await findFavsFloorPage(P, P.minFavs, sess.lastPage);
+            const floor = await findFavsFloorPage(sess, P, P.minFavs, sess.lastPage);
             if (floor === -1) return 'abort';
+            if (floor === -2) return 'stopped';
             sess.lastPage = Math.min(sess.lastPage, floor);
             sess.favFloorDone = true;
         }
         sess.page = 1;
         if (P.maxFavsOn && P.maxFavs > 0) {
-            const pg = await findFavsStartPage(P, P.maxFavs, sess.lastPage);
+            const pg = await findFavsStartPage(sess, P, P.maxFavs, sess.lastPage);
             if (pg === -1) return 'abort';
+            if (pg === -2) return 'stopped';
             sess.page = pg;
             if (sess.page > sess.lastPage) return 'empty';
         }
         return 'ok';
     }
 
-    function setContBar (mode, label, note) {
-        let bar = document.getElementById('nx-cont-bar');
-        if (mode === 'none') { if (bar) bar.remove(); return; }
-        if (!bar) {
-            bar = mk('div', 'nx-cont-bar'); bar.id = 'nx-cont-bar';
-            const b = mk('button', 'nx-btn'); b.type = 'button';
-            b.addEventListener('click', () => { if (!_running) continueSearch(); });
-            bar.append(b, mk('span', 'nx-cont-note'));
-            const sec = getSection();
-            if (!sec) return;
-            sec.parentNode.insertBefore(bar, sec.nextSibling);
-        }
-        const btn = bar.querySelector('.nx-btn');
-        const noteEl = bar.querySelector('.nx-cont-note');
-        bar.classList.toggle('nx-done', mode === 'done');
-        btn.classList.toggle('nx-loading', mode === 'load');
-        btn.disabled = mode !== 'go';
-        btn.innerHTML = (mode === 'load' ? IC.sync : mode === 'done' ? IC.ok : IC.play) +
-                        '<span>' + (label || (mode === 'done' ? 'No more results' : 'Continue')) + '</span>';
-        noteEl.textContent = note || '';
+    /* ── the job strip: live job/batch/counts/phase in the panel ── */
+    let _jobRaf = false;
+    function renderJobStrip () {
+        if (_jobRaf || !UI || !UI.jobstrip) return;
+        _jobRaf = true;
+        requestAnimationFrame(() => {
+            _jobRaf = false;
+            syncRunButtons();
+            const el = UI.jobstrip; if (!el) return;
+            if (!_session) { el.hidden = true; el.textContent = ''; return; }
+            const s = _session, P = s.params;
+            let txt;
+            if (s.mode === 'rank') {
+                if (s.phase === 'collecting') {
+                    txt = 'job #' + s.id + ' · collecting page ' + (s.rankCursor || s.winTop || 1) + '/' + Math.max(1, (s.winBot || 1) - 1) +
+                          ' · ' + (s.rankCollected || 0) + ' matches';
+                } else {
+                    const pool = s.rankMatches ? s.rankMatches.length : (s.rankTotal || 0);
+                    txt = 'job #' + s.id + ' · batch ' + s.batchNum + ' · ' + (s.batchServed || 0) + '/' + P.batchSize + ' in batch' +
+                          ' · ' + (s.served || 0) + ' served · ' + Math.max(0, pool - (s.rankRank || 0)) + ' left in window';
+                }
+            } else {
+                txt = 'job #' + s.id + ' · batch ' + s.batchNum + ' · ' + (s.batchServed || 0) + '/' + P.batchSize + ' in batch' +
+                      ' · ' + (s.served || 0) + ' served · ' + (s.skipped || 0) + ' skipped';
+            }
+            if (s.dupes) txt += ' · ' + s.dupes + ' dupes';
+            txt += ' · page ' + s.page;
+            if (s.phase !== 'exhausted' && s.winBot > 1 && s.page < s.winBot) {
+                const density = s.pagesScanned ? (s.served || 0) / s.pagesScanned : 1;
+                const left = Math.max(0, Math.round((s.winBot - 1 - s.page) * density));
+                txt += ' · ≈' + left.toLocaleString() + ' left';
+            }
+            el.hidden = false;
+            el.innerHTML = '<span class="nx-phase nx-phase-' + (s.phase || 'awaiting') + '">' + phaseLabel(s.phase) + '</span>' +
+                           '<span class="nx-job-txt">' + txt + '</span>';
+        });
     }
 
-    async function bufferCore (sess) {
+    function syncRunButtons () {
+        if (!UI || !UI.btnStop) return;
+        const paused = !!(_session && _session.phase === 'paused');
+        UI.btnStop.forEach(b => {
+            b.disabled = !_running && !paused;
+            if (b.id === 'nx-stop2') {
+                const label = paused ? 'Resume' : 'Pause';
+                if (b.textContent !== label) b.textContent = label;
+            }
+            b.title = paused ? 'Resume the paused scan' : 'Pause safely after the current page (state is saved)';
+        });
+    }
+
+    function pauseSearch () {
+        if (!_running) return;
+        _stop = true;
+        setStatus('Pausing after the current page…');
+    }
+
+    /* dynamic batch size: re-read the field on every batch so the
+       user's current number is always respected, never hardcoded. */
+    function refreshBatchSize (sess) {
+        if (!UI || !UI.inputs || !UI.inputs.bs) return sess.params.batchSize;
+        const n = clampInt(UI.inputs.bs.value, 1, 1000, sess.params.batchSize);
+        if (n !== sess.params.batchSize) { sess.params.batchSize = n; set('batchSize', n); }
+        return n;
+    }
+
+    /* one-time post-restore sanity check: the page at the cursor must
+       still hold the last wallpaper we served. If wallhaven's results
+       shifted (new uploads, reordering), say so — doneIds still
+       guarantees no duplicate processing, only page order differs. */
+    async function verifyCursor (sess) {
+        if (sess.cursorVerified || !sess.lastServedId) { sess.cursorVerified = true; return; }
+        const page = sess.itemIdx > 0 ? sess.page : Math.max(1, sess.page - 1);
+        const r = await cachedPage(sess, page);
+        if (r && r.data && !r.stopped && !r.fatal) {
+            const idx = sess.itemIdx > 0 ? sess.itemIdx - 1 : -1;
+            const ok = idx >= 0
+                ? (r.data[idx] && String(r.data[idx].id) === String(sess.lastServedId))
+                : r.data.some(w => String(w.id) === String(sess.lastServedId));
+            if (!ok) {
+                setStatus('⚠ Wallhaven results shifted since this job was saved. Continuing from the saved cursor — ' +
+                          'already-served wallpapers stay excluded, but page order may differ from before.');
+            }
+        }
+        sess.cursorVerified = true;
+    }
+
+    /* ── RANKED WINDOW — favorites sort inside a date window ──
+       In the favorites-ordered index a date window is sparse: the
+       top-favorites pages are years old and almost nothing falls
+       inside a recent range, so a favorites walk can scan hundreds
+       of pages without a single eligible match. Instead: collect
+       the window ONCE in upload order — every page between winTop
+       and winBot is already inside the range, so the pass is exact
+       and minimal — rank the matches by ♥, then serve the top N of
+       each batch instantly from memory. Collection is checkpointed
+       per page (crash-safe), pause/fatal resume at the cursor, and
+       the served-id ledger still guarantees no wallpaper is ever
+       served twice. */
+    async function rankCore (sess) {
+        if (!sess || sess.phase === 'exhausted') return;
         _running = true; _stop = false;
-        setRunningUI(true);
+        sess.phase = 'running';
+        setRunningUI(true); renderJobStrip();
         const ul = getUL();
-        if (!ul) { setStatus('✕ Grid not found.', true); _running = false; setRunningUI(false); return; }
+        if (!ul) { setStatus('✕ Grid not found.', true); _running = false; setRunningUI(false); sess.phase = 'awaiting'; return; }
         const P = sess.params;
-        const SW = { ...P, baseParams: { ...P.baseParams, sorting: 'date_added' } };
+        const DP = { ...P, baseParams: { ...P.baseParams, sorting: 'date_added' } };
+        const B = refreshBatchSize(sess);
+        let fatal = null, stopped = false;
 
-        if (!sess.scanned) {
-            while (!_stop && sess.scanPage < sess.winBot) {
-                const page = sess.scanPage;
-                setStatus('Collecting ' + P.dateFrom + ' → ' + P.dateTo + ' in upload order' +
-                          (sess.rank ? ' · ' + sess.rank + ' already served' : '') +
-                          ' · page ' + page + '/' + (sess.winBot - 1) + ' · ' + sess.matches.length + ' matches');
-                setContBar('load', 'Collecting window · page ' + page + '/' + (sess.winBot - 1),
-                           sess.matches.length + ' matches · one-time scan');
-                setProgress(Math.min(99, Math.round(((page - sess.winTop) / Math.max(1, sess.winBot - sess.winTop)) * 100)));
-                const r = await scanFetch(SW, page);
-                if (r.stopped) break;
-                if (r.fatal) {
-                    _running = false; setRunningUI(false);
-                    sessionSave(sess);
-                    setStatus(r.msg, true);
-                    setContBar('go', 'Continue — retry collection', 'state preserved · page ' + sess.scanPage);
-                    return;
-                }
-                if (r.done) { sess.winBot = page; break; }
-                for (const w of r.data) {
-                    const d = (w.created_at || '').slice(0, 10);
-                    if (d < P.dateFrom || d > P.dateTo) continue;
-                    if (w.favorites < P.minFavs) continue;
-                    if (P.maxFavsOn && P.maxFavs > 0 && w.favorites > P.maxFavs) continue;
-                    if (sess.collectedIds.has(w.id)) continue;
-                    sess.collectedIds.add(w.id);
-                    sess.matches.push(w);
-                }
-                sess.scanPage = page + 1;
-                await sleep(300);
+        for (;;) {
+            /* phase 1 — collect the window once, in upload order */
+            if (!sess.rankScanned) {
+                sess.phase = 'collecting';
+                setProgress(0);
+                let pre = null;
+                try {
+                    while (!_stop && sess.rankCursor < sess.winBot) {
+                        const pg = sess.rankCursor;
+                        setContBar('load', 'Collecting window · page ' + pg + '/' + Math.max(1, sess.winBot - 1),
+                                   (sess.rankMatches.length || 0).toLocaleString() + ' matches · one-time scan');
+                        setStatus('Collecting ' + P.dateFrom + ' → ' + P.dateTo + ' in upload order · page ' + pg + '/' + Math.max(1, sess.winBot - 1) + ' · ' + (sess.rankMatches.length || 0) + ' matches');
+                        setProgress(Math.min(96, Math.round(((pg - sess.winTop) / Math.max(1, sess.winBot - sess.winTop)) * 100)));
+                        renderJobStrip();
+                        let r = pre ? await pre : null; pre = null;   /* v7.6.2: the stored prefetch is a Promise — await it */
+                        if (!r) r = await cachedPage(sess, pg, DP);   /* rejected probe → fresh, retried fetch */
+                        if (r.stopped) { stopped = true; break; }
+                        if (r.fatal)  { fatal = r.msg; break; }
+                        if (r.done)   { sess.winBot = pg; break; }
+                        if (pg + 1 < sess.winBot) pre = cachedPage(sess, pg + 1, DP).catch(() => null);   /* overlap latency, no extra requests */
+                        for (const w of r.data) {
+                            const d = (w.created_at || '').slice(0, 10);
+                            if (d < P.dateFrom || d > P.dateTo) { sess.skipped++; continue; }
+                            if (w.favorites < P.minFavs) { sess.skipped++; continue; }
+                            if (P.maxFavsOn && P.maxFavs > 0 && w.favorites > P.maxFavs) { sess.skipped++; sess.skippedAbove++; continue; }
+                            sess.rankMatches.push(w);
+                        }
+                        sess.rankCursor = pg + 1;
+                        sess.rankCollected = sess.rankMatches.length;
+                        sess.pagesScanned++;
+                        sessionCheckpoint(sess);
+                        renderJobStrip();
+                        await sleep(300);
+                    }
+                } catch (e) { fatal = '✕ Unexpected error: ' + (e && e.message); }
+                if (_stop && !fatal && !stopped) stopped = true;   /* v7.6.2: a pause that lands between awaits parks the job */
+                if (fatal || stopped) break;
+                sess.rankScanned = true;
+                sess.rankTotal = sess.rankMatches.length;
+                sess.rankMatches.sort((a, b) => (b.favorites - a.favorites) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+                setStatus('Ranking ' + sess.rankTotal.toLocaleString() + ' matches by favorites…');
             }
-            if (_stop) {
+
+            /* phase 2 — serve the top of the ranked pool */
+            sess.phase = 'running';
+            setContBar('load', 'Batch ' + sess.batchNum + ' · ' + (sess.batchServed || 0) + '/' + B, '');
+            renderJobStrip();
+            ensureBatchPage(sess, ul);            /* v7.7: this batch gets its own page */
+            const frag = document.createDocumentFragment();
+            let lastId = sess.lastServedId;
+            while (sess.batchServed < B && sess.rankRank < sess.rankMatches.length) {
+                const w = sess.rankMatches[sess.rankRank++];
+                const wid = String(w.id);
+                if (sess.doneIds.has(wid) || _seenIds.has(wid)) { sess.dupes++; continue; }
+                _seenIds.add(wid); sess.doneIds.add(wid);
+                frag.appendChild(mkCard(w));
+                sess.batchItems.push(w);
+                sess.batchServed++; sess.served++; lastId = wid;
+            }
+            if (frag.childNodes.length) ul.appendChild(frag);
+            sess.lastServedId = lastId;
+            setCount(sess.batchServed);            /* v7.7: the pill counts the page being served */
+            renderJobStrip();
+
+            if (sess.batchServed >= B) {                       /* batch filled */
+                sess.batches.push({ n: sess.batchNum, count: sess.batchServed, ts: Date.now(),
+                                    lastId: lastId || '', paged: true });
+                bpageSave(sess.id, sess.batchNum, sess.batchItems);   /* v7.7: the batch's own page payload */
+                setCount(sess.batchServed);                    /* v7.7: the pill counts the page on screen */
+                sess.batchNum++; sess.batchServed = 0; sess.phase = 'awaiting';
                 _running = false; setRunningUI(false);
-                sessionSave(sess);
-                setStatus('Paused · page ' + sess.scanPage + '/' + (sess.winBot - 1) + ' · ' + sess.matches.length + ' matches collected');
-                setContBar('go', 'Continue — finish collection', 'resumes at page ' + sess.scanPage);
-                return;
+                scanBarResolve();               /* v8.1 */
+                sessionSave(sess); sess.batchItems = [];
+                const left = Math.max(0, sess.rankMatches.length - sess.rankRank);
+                setContBar('go', 'Continue — next ' + B + ' (batch ' + sess.batchNum + ')',
+                           left > 0 ? 'instant · fresh page · ' + left.toLocaleString() + ' ranked matches left' : 'one-time scan');
+                setStatus('✓ Batch ' + (sess.batchNum - 1) + ' · ' + sess.served.toLocaleString() + ' served · ' +
+                          'top ♥ first' +
+                          (left > 0 ? ' · ' + left.toLocaleString() + ' left in the window' : ''));
+                break;
             }
-            sess.scanned = true;
-            sess.matches.sort((a, b) => (b.favorites - a.favorites) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-            setStatus('Ranking ' + sess.matches.length + ' matches by favorites…');
-        }
-
-        sess.batchItems = [];
-        const serve = [];
-        let i = sess.rank;
-        while (i < sess.matches.length && serve.length < P.batchSize) {
-            const w = sess.matches[i++];
-            if (_seenIds.has(w.id)) continue;
-            serve.push(w);
-        }
-        sess.rank = i;
-        const frag = document.createDocumentFragment();
-        for (const w of serve) { _seenIds.add(w.id); frag.appendChild(mkCard(w)); sess.batchItems.push(w); }
-        if (frag.childNodes.length) ul.appendChild(frag);
-        const left = Math.max(0, sess.matches.length - sess.rank);
-        sess.totalFound = sess.rank;
-        sess.batchNum++;
-        sess.exhausted = left <= 0;
-        setCount(sess.rank);
-        setProgress(100); setTimeout(() => setProgress(0), 900);
-        _running = false; setRunningUI(false);
-        sessionSave(sess);
-        if (sess.exhausted) {
-            setContBar('done', 'No more results', sess.matches.length + ' matches in window');
-            setStatus('✓ Complete — ' + sess.matches.length + ' matching wallpapers in ' + P.dateFrom + ' → ' + P.dateTo + (sess.rank ? ' · all served' : ''));
-            if (sess.rank === 0) {
+            if (sess.rankTailLost) {                            /* saved tail ran dry — re-verify the window */
+                sess.rankTailLost = false; sess.rankScanned = false;
+                sess.rankMatches = []; sess.rankRank = 0; sess.rankCursor = sess.winTop; sess.rankCollected = 0;
+                setStatus('Saved tail ran out — re-verifying the window (nothing already served repeats)…');
+                continue;
+            }
+            if (sess.batchServed > 0) {                         /* v7.7: the final partial batch is a page too */
+                sess.batches.push({ n: sess.batchNum, count: sess.batchServed, ts: Date.now(),
+                                    lastId: sess.lastServedId || '', paged: true, final: true });
+                bpageSave(sess.id, sess.batchNum, sess.batchItems);
+            }
+            sess.exhausted = true; sess.phase = 'exhausted';    /* pool truly dry — honest completion */
+            _running = false; setRunningUI(false);
+            scanBarResolve();               /* v8.1: the single-batch-exhausted job used to leave the bar frozen mid-way — it always resolves now */
+            sessionSave(sess); sess.batchItems = [];
+            setContBar('done', 'No more results', (sess.rankTotal || sess.served || 0).toLocaleString() + ' matches in window');
+            setStatus(sess.rankTotal
+                ? '✓ Complete — ' + sess.rankTotal.toLocaleString() + ' matching wallpapers in ' + P.dateFrom + ' → ' + P.dateTo + ' · all served'
+                : '✓ No matching wallpapers in this window — try widening the range or lowering Min ♥.');
+            if (!sess.rankTotal && !sess.served) {
                 const li = mk('li', 'nx-empty');
                 li.innerHTML = '<strong>No wallpapers matched.</strong><br>The date window contains no uploads that pass the favorites filter.';
                 ul.appendChild(li);
             }
-        } else {
-            setContBar('go', 'Continue — next ' + P.batchSize + ' (batch ' + sess.batchNum + ')',
-                       'instant · ' + left + ' matches left');
-            setStatus('✓ Batch ' + (sess.batchNum - 1) + ' · ' + serve.length + ' served · ' + left + ' left · Continue is instant');
+            break;
         }
+
+        if (fatal) {
+            sess.phase = 'error'; sess.lastError = fatal;
+            _running = false; setRunningUI(false);
+            scanBarResolve();               /* v8.1 */
+            sessionSave(sess);
+            setStatus(fatal, true);
+            setContBar('go', 'Continue — retry collection', 'state preserved · resumes at page ' + sess.rankCursor);
+        } else if (stopped) {
+            sess.phase = 'paused';
+            _running = false; setRunningUI(false);
+            scanBarResolve();               /* v8.1 */
+            sessionSave(sess);
+            setStatus('Paused · ' + (sess.rankCollected || 0).toLocaleString() + ' matches collected · state saved');
+            setContBar('go', sess.rankScanned ? 'Resume — finish batch ' + sess.batchNum : 'Resume — collect window',
+                       'state preserved · resumes at page ' + sess.rankCursor);
+        }
+        setCount(sess.batchServed || 0);            /* v7.7: the pill counts the page on screen */
+        renderJobStrip();
+        refreshHistoryPanel();
+    }
+
+    /* v7.7 — every batch is its own PAGE. A fresh batch starts from
+       a clean grid (never a continuous stream), and a resumed
+       partial batch rebuilds its page first when the screen is
+       showing something else (an older batch, another job, or the
+       native listing after Clear) — so a page never mixes batches. */
+    function ensureBatchPage (sess, ul) {
+        const want = sess.id + '#' + sess.batchNum;
+        if ((sess.batchServed || 0) === 0) ul.textContent = '';
+        else if (_gridPage !== want) renderBatch(batchLoad(sess.id).filter(w => sess.doneIds.has(String(w.id))));
+        _gridPage = want;
+        syncBackBtn(); syncFwdBtn();     /* v8.1: the arrows follow the page tag live */
     }
 
     async function coreScan (sess, preloaded) {
-        if (!sess || sess.exhausted) return;
-        if (sess.mode === 'buffer') { await bufferCore(sess); return; }
+        if (!sess || sess.phase === 'exhausted') return;
+        if (sess.legacy) { startFreshFromLegacy(sess); return; }
 
         _running = true; _stop = false;
-        setRunningUI(true);
-        setProgress(0);
+        sess.phase = 'running';
+        setRunningUI(true); renderJobStrip(); setProgress(0);
         const ul = getUL();
-        if (!ul) { setStatus('✕ Grid not found.', true); _running = false; setRunningUI(false); return; }
-
+        if (!ul) { setStatus('✕ Grid not found.', true); _running = false; setRunningUI(false); sess.phase = 'awaiting'; return; }
         const P = sess.params;
+        const B = refreshBatchSize(sess);
+
+        ensureBatchPage(sess, ul);          /* v7.7: this batch gets its own page */
+        await verifyCursor(sess);
+
         let page = sess.page, itemIdx = sess.itemIdx, lastPage = sess.lastPage || 1;
-        let skippedAbove = sess.skippedAbove || 0;
-        let batchNum = sess.batchNum, batchFound = sess.batchFound || 0, totalFound = sess.totalFound || 0;
-        let consecMisses = sess.consecMisses || 0;
-        let exhausted = false, stopped = false, fatal = null, checkpoint = false;
+        let served = sess.served || 0, skipped = sess.skipped || 0, dupes = sess.dupes || 0;
+        let skippedAbove = sess.skippedAbove || 0, consecMisses = sess.consecMisses || 0, pagesScanned = sess.pagesScanned || 0;
+        let batchServed = sess.batchServed || 0, batchNum = sess.batchNum;
+        let exhausted = false, stopped = false, fatal = null, sparse = false;
         const firstPage = page, firstIdx = itemIdx;
         sess.batchItems = sess.batchItems || [];
 
         try {
             outer:
-            while (!_stop && batchFound < P.batchSize) {
-                const pDen = sess.winBot ? (sess.winBot - 1) : lastPage;
-                const prog = 'Batch ' + batchNum + ' · ' + batchFound + '/' + P.batchSize;
+            while (!_stop && batchServed < B) {
+                const prog = 'Batch ' + batchNum + ' · ' + batchServed + '/' + B;
                 setContBar('load', prog, '');
-                setStatus(prog + ' · page ' + page + (pDen > 1 ? '/' + pDen : '') +
-                          (skippedAbove > 0 && P.maxFavsOn ? ' · ' + skippedAbove.toLocaleString() + ' skipped' : ''));
-                setProgress(Math.min(95, Math.round((batchFound / P.batchSize) * 100)));
+                setStatus(prog + ' · page ' + page + ' · ' + served + ' served' +
+                          (skippedAbove > 0 ? ' · ' + skippedAbove.toLocaleString() + ' skipped' : ''));
+                setProgress(Math.min(95, Math.round((batchServed / B) * 100)));
+                renderJobStrip();
 
                 let items = null, meta = null;
                 if (preloaded && page === 1) { items = preloaded.data; meta = preloaded.meta; preloaded = null; }
                 else {
-                    const r = await scanFetch(P, page);
+                    const r = await cachedPage(sess, page);
                     if (r.stopped) { stopped = true; break; }
                     if (r.fatal)  { fatal = r.msg; break; }
                     if (r.done)   { exhausted = true; break; }
@@ -4210,106 +5964,145 @@
                 const frag = document.createDocumentFragment();
                 for (let i = (page === firstPage ? firstIdx : 0); i < items.length; i++) {
                     const w = items[i];
-                    if (batchFound >= P.batchSize) { stopIdx = i; break; }
+                    if (batchServed >= B) { stopIdx = i; break; }
                     const d = (w.created_at || '').slice(0, 10);
                     if (P.sortMode === 'date_added') {
                         if (d < P.dateFrom) { exhausted = true; break; }
-                        if (d > P.dateTo) continue;
-                        if (w.favorites < P.minFavs) continue;
-                        if (P.maxFavsOn && P.maxFavs > 0 && w.favorites > P.maxFavs) { skippedAbove++; continue; }
+                        if (d > P.dateTo) { skipped++; continue; }
+                        if (w.favorites < P.minFavs) { skipped++; continue; }
+                        if (P.maxFavsOn && P.maxFavs > 0 && w.favorites > P.maxFavs) { skipped++; skippedAbove++; continue; }
                     } else {
                         if (w.favorites < P.minFavs) { exhausted = true; break; }
-                        if (P.maxFavsOn && P.maxFavs > 0 && w.favorites > P.maxFavs) { skippedAbove++; continue; }
+                        if (P.maxFavsOn && P.maxFavs > 0 && w.favorites > P.maxFavs) { skipped++; skippedAbove++; continue; }
                         pageInRange++;
-                        if (d < P.dateFrom || d > P.dateTo) continue;
+                        if (d < P.dateFrom || d > P.dateTo) { skipped++; continue; }
                     }
-                    if (_seenIds.has(w.id)) continue;
-                    _seenIds.add(w.id);
+                    const wid = String(w.id);
+                    if (sess.doneIds.has(wid) || _seenIds.has(wid)) { dupes++; continue; }   /* never reprocess */
+                    _seenIds.add(wid); sess.doneIds.add(wid); sess.lastServedId = wid;
                     frag.appendChild(mkCard(w));
                     sess.batchItems.push(w);
-                    batchFound++; totalFound++;
-                    pageMatched++;
+                    served++; batchServed++; pageMatched++;
                 }
                 if (frag.childNodes.length) ul.appendChild(frag);
-                setCount(totalFound);
+                setCount(batchServed);         /* v7.7: the pill counts the page being served */
+                pagesScanned++;
 
                 if (exhausted) break;
                 if (stopIdx >= 0) { itemIdx = stopIdx; break; }
 
                 if (P.sortMode === 'favorites' && pageInRange > 0 && pageMatched === 0) {
                     consecMisses++;
-                    if (consecMisses >= MAX_CONSEC_MISS) { checkpoint = true; break; }
+                    if (consecMisses >= MAX_CONSEC_MISS) { sparse = true; break; }
                 } else if (pageMatched > 0) consecMisses = 0;
 
                 if ((sess.winBot && page >= sess.winBot) || page >= lastPage) { exhausted = true; break; }
                 page++; itemIdx = 0;
+
+                /* crash-safe checkpoint once per page — cursor + counters */
+                sess.page = page; sess.itemIdx = 0; sess.lastPage = lastPage;
+                sess.served = served; sess.skipped = skipped; sess.dupes = dupes;
+                sess.skippedAbove = skippedAbove; sess.batchServed = batchServed;
+                sess.pagesScanned = pagesScanned; sess.consecMisses = consecMisses;
+                sessionCheckpoint(sess);
+                renderJobStrip();
+
+                /* one-page-ahead prefetch while the DOM settles — no
+                   extra requests, just overlapped latency */
+                if (batchServed < B) prefetch(sess, page);
                 await sleep(300);
             }
         } catch (e) { fatal = '✕ Unexpected error: ' + (e && e.message); }
 
+        /* a pause that lands between awaits (loop-condition exit) must
+           still count as stopped — unless the batch filled anyway, in
+           which case it completes instead of parking */
+        if (_stop && !fatal && !exhausted && !sparse && batchServed < B) stopped = true;
+
         sess.page = page; sess.itemIdx = itemIdx; sess.lastPage = lastPage;
-        sess.skippedAbove = skippedAbove; sess.totalFound = totalFound;
-        sess.consecMisses = checkpoint ? 0 : consecMisses;
+        sess.served = served; sess.skipped = skipped; sess.dupes = dupes;
+        sess.skippedAbove = skippedAbove; sess.batchServed = batchServed;
+        sess.pagesScanned = pagesScanned; sess.consecMisses = sparse ? 0 : consecMisses;
         sess.exhausted = exhausted;
 
-        const batchDone = batchFound >= P.batchSize;
-        if (batchDone) { sess.batchNum = batchNum + 1; sess.batchFound = 0; }
-        else sess.batchFound = batchFound;
+        const batchDone = batchServed >= B && !exhausted && !stopped && !fatal && !sparse;
+        if (batchDone || (exhausted && batchServed > 0)) {     /* v7.7: every completed batch — the final partial included — becomes a sub-history card with its own page */
+            sess.batches.push({ n: batchNum, count: batchServed, ts: Date.now(),
+                                lastId: sess.lastServedId || '', paged: true, final: !!exhausted });
+            bpageSave(sess.id, batchNum, sess.batchItems);
+        }
+        if (batchDone) {
+            sess.batchNum = batchNum + 1; sess.batchServed = 0;
+            sess.phase = 'awaiting';
+        } else if (exhausted) sess.phase = 'exhausted';
+        else if (stopped) sess.phase = 'paused';
+        else if (fatal) { sess.phase = 'error'; sess.lastError = fatal; }
+        else if (sparse) sess.phase = 'sparse';
 
         _running = false;
         setRunningUI(false);
-        setProgress(batchFound > 0 ? 100 : 0);
+        setProgress(batchServed > 0 ? 100 : 0);
         setTimeout(() => setProgress(0), 900);
 
-        if (totalFound > 0 || sess.batchItems.length) sessionSave(sess);
-        if (batchDone) sess.batchItems = [];
-        if (sess.exhausted && totalFound === 0 && !sess.batchItems.length && !fatal && !stopped && !checkpoint) {
+        sessionSave(sess);
+        if (batchDone || exhausted) sess.batchItems = [];
+        setCount(batchServed);                    /* v7.7: the pill counts the page on screen */
+        if (sess.exhausted && served === 0 && !sess.batchItems.length && !fatal && !stopped && !sparse) {
             const li = mk('li', 'nx-empty');
             li.innerHTML = '<strong>No wallpapers found.</strong><br>Try widening the date range, lowering Min ♥, or switching sort mode.';
             ul.appendChild(li);
         }
 
+        const left = Math.max(0, B - batchServed);
         if (fatal) {
             setStatus(fatal, true);
-            setContBar('go', 'Continue — finish batch ' + batchNum + ' (' + (P.batchSize - batchFound) + ' left)',
+            setContBar('go', 'Continue — finish batch ' + batchNum + ' (' + left + ' left)',
                        'state preserved · resumes at page ' + page);
         } else if (stopped) {
-            setStatus('Stopped · ' + totalFound.toLocaleString() + ' collected');
-            setContBar('go', batchDone ? 'Continue — batch ' + sess.batchNum : 'Continue — finish batch ' + batchNum,
+            setStatus('Paused · ' + served.toLocaleString() + ' served · state saved');
+            setContBar('go', 'Resume — finish batch ' + batchNum + ' (' + left + ' left)',
                        'state preserved · resumes at page ' + page);
         } else if (exhausted) {
-            setContBar('done', 'No more results', totalFound.toLocaleString() + ' collected');
+            setContBar('done', 'No more results', served.toLocaleString() + ' collected');
             setStatus(batchDone
                 ? '✓ Batch ' + batchNum + ' complete — no more matching results'
-                : '✓ No more matching results · only ' + totalFound.toLocaleString() + ' exist for these filters');
-        } else if (checkpoint) {
-            setStatus('⚠ Sparse in favorites order — no date matches in ' + MAX_CONSEC_MISS + ' pages (now at page ' + page + '). Continue the scan, narrow the range, or raise Min ♥.');
+                : '✓ No more matching results · only ' + served.toLocaleString() + ' exist for these filters');
+        } else if (sparse) {
+            setStatus('⚠ Sparse in favorites order — no date matches in ' + MAX_CONSEC_MISS + ' pages (now at page ' + page + '). Continue the deep scan, narrow the range, or raise Min ♥.');
             setContBar('go', 'Continue deep scan — page ' + page, 'results are sparse in this order');
         } else if (batchDone) {
-            setStatus('✓ Batch ' + batchNum + ' complete · ' + totalFound.toLocaleString() + ' collected · next: #' + sess.batchNum);
-            setContBar('go', 'Continue — next ' + P.batchSize + ' (batch ' + sess.batchNum + ')',
-                       'total ' + totalFound.toLocaleString() + ' so far');
+            setStatus('✓ Batch ' + batchNum + ' complete · ' + served.toLocaleString() + ' served · next: #' + sess.batchNum);
+            setContBar('go', 'Continue — next ' + B + ' (batch ' + sess.batchNum + ')',
+                       'fresh page · total ' + served.toLocaleString() + ' served · walk page ' + page);
         }
+        renderJobStrip();
+        refreshHistoryPanel();
     }
 
     async function startScan (sess) {
         _running = true; _stop = false;
-        setRunningUI(true);
+        sess.phase = 'running';
+        setRunningUI(true); renderJobStrip();
         setContBar('load', 'Scanning…', '');
         const P = sess.params;
         const DP = { ...P, baseParams: { ...P.baseParams, sorting: 'date_added' } };
 
         setStatus('Scanning… page 1');
-        const probe = await scanFetch(P, 1);
-        if (probe.stopped) { _running = false; setRunningUI(false); setContBar('none', '', ''); return; }
+        const probe = await cachedPage(sess, 1);   /* v7.6.2: cached — the walk reuses page 1 instead of refetching */
+        if (probe.stopped) { _running = false; setRunningUI(false); sess.phase = 'paused'; sessionCheckpoint(sess); renderJobStrip(); scanBarResolve(); setContBar('go', 'Resume scan', ''); return; }
         if (probe.fatal) {
             _running = false; setRunningUI(false);
+            sess.phase = 'error'; sess.lastError = probe.msg; sessionCheckpoint(sess); renderJobStrip();
+            scanBarResolve();               /* v8.1 */
             setStatus(probe.msg, true);
             setContBar('go', 'Continue — retry scan', '');
             return;
         }
         if (probe.done) {
             _running = false; setRunningUI(false);
+            sess.exhausted = true; sess.phase = 'exhausted';
+            sessionSave(sess);
+            scanBarResolve();               /* v8.1 */
             setStatus('⚠ No results — check filters' + (get('apiKey') ? '' : ' / API key') + '.');
             const ul = getUL();
             if (ul) {
@@ -4318,91 +6111,156 @@
                 ul.appendChild(li);
             }
             setContBar('done', 'No more results', '');
+            renderJobStrip(); refreshHistoryPanel();
             return;
         }
         sess.lastPage = Math.min((probe.meta && probe.meta.last_page) || 1, MAX_SAFE_PAGE);
 
         if (P.sortMode === 'date_added') {
-            sess.mode = 'walk';
             let winTop = 1;
             if (P.dateTo < todayStr()) {
-                winTop = await findDateStartPage(DP, P.dateTo, sess.lastPage);
+                winTop = await findDateStartPage(sess, DP, P.dateTo, sess.lastPage);
                 if (winTop === -1) return abortStart('✕ API unavailable while locating the date range — try again.');
+                if (winTop === -2) { scanStopped(sess); return; }
             }
             if (winTop > sess.lastPage) return emptyWindow(sess);
             if (P.dateTo < todayStr() || P.dateFrom > '2010-01-01') {
-                const winBot = await findDateEndPage(DP, P.dateFrom, sess.lastPage);
+                const winBot = await findDateEndPage(sess, DP, P.dateFrom, sess.lastPage);
                 if (winBot === -1) return abortStart('✕ API unavailable while locating the date range — try again.');
+                if (winBot === -2) { scanStopped(sess); return; }
                 sess.winBot = winBot;
                 if (winBot <= winTop) return emptyWindow(sess);
             }
             sess.page = winTop;
-            setStatus('Upload order · scanning the window' + (sess.winBot ? ' (≈' + Math.max(0, sess.winBot - winTop) + ' pages)' : ''));
+            setStatus('Upload order · true batch walk' + (sess.winBot ? ' (≈' + Math.max(0, sess.winBot - winTop) + ' pages in window)' : ''));
             await coreScan(sess, winTop === 1 ? probe : null);
             return;
         }
 
+
+        /* favorites order — strategy selection:
+           · no date window → the favorites walk IS the result
+             sequence and every page is in range (dense, optimal);
+           · date window → choose between the ranked-window pass
+             (collect the contiguous window in upload order once,
+             rank by ♥, serve the top N per batch — right when the
+             window is sparse in favorites order, which it almost
+             always is) and the favorites walk (only when sampling
+             proves it is clearly cheaper for this batch size). */
         const bounded = P.dateTo < todayStr() || P.dateFrom > '2010-01-01';
-        if (!bounded) {            sess.mode = 'walk';
+        if (!bounded) {
             const prep = await prepareFavsWalk(sess);
             if (prep === 'abort') return abortStart('✕ API unavailable while locating favorites bounds — try again.');
+            if (prep === 'stopped') { scanStopped(sess); return; }
             if (prep === 'empty') return maxFavsEmpty(sess);
-            setStatus('Favorites order · ♥ floor at page ' + sess.lastPage + ' · matches are dense');
+            setStatus('Favorites order · true batch walk · ♥ floor at page ' + sess.lastPage);
             await coreScan(sess, sess.page === 1 ? probe : null);
             return;
         }
 
-        const winTop = P.dateTo < todayStr()
-            ? await findDateStartPage(DP, P.dateTo, sess.lastPage)
-            : 1;
-        if (winTop === -1) return abortStart('✕ API unavailable while locating the date range — try again.');
-        const winBot = await findDateEndPage(DP, P.dateFrom, sess.lastPage);
+        let winTop = 1;
+        if (P.dateTo < todayStr()) {
+            winTop = await findDateStartPage(sess, DP, P.dateTo, sess.lastPage);
+            if (winTop === -1) return abortStart('✕ API unavailable while locating the date range — try again.');
+            if (winTop === -2) { scanStopped(sess); return; }
+        }
+        const winBot = await findDateEndPage(sess, DP, P.dateFrom, sess.lastPage);
         if (winBot === -1) return abortStart('✕ API unavailable while locating the date range — try again.');
+        if (winBot === -2) { scanStopped(sess); return; }
         const windowPages = winBot - winTop;
         if (windowPages <= 0 || winTop > sess.lastPage) return emptyWindow(sess);
 
-        let mode = 'buffer', walkEst = 0;
+        let mode = 'rank', walkEst = 0;
         if (windowPages > 60) {
             if (P.minFavs > 0 && !sess.favFloorDone) {
-                const floor = await findFavsFloorPage(P, P.minFavs, sess.lastPage);
+                const floor = await findFavsFloorPage(sess, P, P.minFavs, sess.lastPage);
                 if (floor === -1) return abortStart('✕ API unavailable while locating the favorites floor — try again.');
+                if (floor === -2) { scanStopped(sess); return; }
                 sess.lastPage = Math.min(sess.lastPage, floor);
                 sess.favFloorDone = true;
             }
             setStatus('Estimating scan depth (sampling the favorites region)…');
-            const d = await sampleDensity(P, sess.lastPage);
+            const d = await sampleDensity(sess, P, sess.lastPage);
             walkEst = d > 0 ? Math.ceil(P.batchSize / d) : Infinity;
-            if (windowPages > BUFFER_MAX_PAGES) {
-                mode = 'walk';
-            } else if (walkEst <= WALK_EST_MAX && walkEst * 1.25 < windowPages) {
-                mode = 'walk';
-            }
+            if (windowPages > BUFFER_MAX_PAGES) mode = 'walk';
+            else if (walkEst <= WALK_EST_MAX && walkEst * 1.25 < windowPages) mode = 'walk';
         }
 
-        if (mode === 'buffer') {
-            sess.mode = 'buffer';
+        if (mode === 'rank') {
+            sess.mode = 'rank';
             sess.winTop = winTop; sess.winBot = winBot;
-            sess.scanPage = winTop;
-            setStatus('Strategy: collect the ' + windowPages + '-page window once in upload order, rank by favorites · later batches are instant');
-            await bufferCore(sess);
+            sess.rankCursor = (sess.rankCursor > winTop) ? sess.rankCursor : winTop;
+            setStatus('Ranked window · collecting ' + windowPages + ' pages in upload order, then serving the top ♥ ' + P.batchSize + ' per batch');
+            await rankCore(sess);
             return;
         }
 
-        sess.mode = 'walk';
         const prep = await prepareFavsWalk(sess);
         if (prep === 'abort') return abortStart('✕ API unavailable while locating favorites bounds — try again.');
+        if (prep === 'stopped') { scanStopped(sess); return; }
         if (prep === 'empty') return maxFavsEmpty(sess);
         setStatus('Strategy: favorites-ordered walk' +
-                  (isFinite(walkEst) ? ' (≈' + walkEst + ' pages to a full batch)' : ' (window too large to enumerate)'));
+                  (isFinite(walkEst) ? ' (≈' + walkEst + ' pages to a full batch)' : '') +
+                  ' · ♥ floor at page ' + sess.lastPage);
         await coreScan(sess, sess.page === 1 ? probe : null);
     }
 
+    function scanStopped (sess) {
+        _running = false; setRunningUI(false);
+        sess.phase = 'paused';
+        sessionCheckpoint(sess);
+        scanBarResolve();               /* v8.1: paused mid-probe still resolves the bar */
+        setStatus('Paused · state saved');
+        setContBar('go', 'Resume scan', 'resumes at page ' + sess.page);
+        renderJobStrip();
+    }
+
+    /* v7.5 buffered session → v7.6.1 ranked-window job, keeping the
+       same job identity and excluding whatever is still on screen.
+       v7.5 stored only the unserved tail (cap 600) and had no
+       served-id ledger, so the on-screen batch is the exclusion
+       set; a tail that hit the old cap is re-verified against the
+       window when it runs dry — still never re-serving anything. */
+    function startFreshFromLegacy (sess) {
+        const buf = bufLoad(sess.id);
+        try { GM_deleteValue(BUF_PREFIX + sess.id); } catch {}
+        const P = sess.params;
+        const keepId = sess.id;
+        const keepTs = sess.ts;
+        const seeded = new Set(sess.doneIds || []);
+        for (const w of batchLoad(sess.id)) seeded.add(String(w.id));
+        _session = newSession(P);
+        _session.id = keepId; _session.ts = keepTs;
+        _session.doneIds = seeded;
+        _seenIds = new Set(seeded);
+        if (buf && buf.length) {
+            _session.mode = 'rank';
+            _session.winTop = sess.winTop || 1;
+            _session.winBot = sess.winBot || 0;
+            _session.rankMatches = buf;
+            _session.rankTotal = buf.length;
+            _session.rankScanned = true;
+            _session.rankTailLost = buf.length >= 600;
+            setStatus('v7.5 buffered session → ranked window · ' + buf.length + ' unserved matches recovered · wallpapers already on screen are excluded');
+            refreshHistoryPanel();
+            rankCore(_session);
+            return;
+        }
+        setStatus('v7.5 session → v7.6.2 engine · re-running the search with the true-batch engine');
+        refreshHistoryPanel();
+        startScan(_session);
+    }
+
     function newSession (P) {
-        return { id: Date.now().toString(36), params: P, mode: 'walk',
+        return { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
+                 ts: Date.now(), params: P, name: jobLabel(P), mode: 'walk', phase: 'awaiting',
                  page: 1, itemIdx: 0, lastPage: 1, winBot: 0, skippedAbove: 0, favFloorDone: false,
-                 batchNum: 1, batchFound: 0, totalFound: 0, consecMisses: 0,
-                 exhausted: false, batchItems: [],
-                 winTop: 1, scanPage: 1, matches: [], collectedIds: new Set(), rank: 0, scanned: false };
+                 batchNum: 1, batchServed: 0, served: 0, skipped: 0, dupes: 0, pagesScanned: 0,
+                 consecMisses: 0, exhausted: false, lastServedId: '', lastError: '',
+                 cursorVerified: true, batches: [], batchItems: [],
+                 winTop: 1, rankCursor: 0, rankRank: 0, rankMatches: [], rankScanned: false,
+                 rankCollected: 0, rankTotal: 0, rankTailLost: false,
+                 doneIds: new Set(), pageCache: new Map() };
     }
 
     async function runSearch () {
@@ -4414,16 +6272,35 @@
         ensureSnapshot();
         ul.textContent = '';
         _seenIds = new Set();
+        _gridPage = null;
         setCount(0); setProgress(0);
         setContBar('none', '', '');
         _session = newSession(p);
+        renderJobStrip();
         await startScan(_session);
+        if (!_running) scanBarResolve();      /* v8.1: the catch-all — no terminal can leave the bar mid-flight */
+        refreshHistoryPanel();
     }
 
     async function continueSearch () {
-        if (_running || !_session || _session.exhausted) return;
-        if (_session.mode === 'buffer') { await bufferCore(_session); return; }
+        if (_running || !_session) return;
+        if (_session.phase === 'exhausted') return;
+        /* v7.8 — WHERE A CONTINUE STARTS FROM (state-based, never
+           timing-based):
+           · a NEW batch — phase 'awaiting' with nothing served into
+             it yet — opens at the very TOP of the fresh page;
+           · a RESUME of an interrupted batch — paused, error, sparse
+             deep-scan, or mid-batch — keeps the user's position. */
+        const resuming = _session.phase === 'paused' || _session.phase === 'error' ||
+                         _session.phase === 'sparse' || ((_session.batchServed || 0) > 0);
+        if (_session.legacy) { nxScrollTop(); startFreshFromLegacy(_session); return; }   /* a fresh ranked page */
+        if (!resuming) nxScrollTop();
+        if (_session.mode === 'rank') { _stop = false; await rankCore(_session); if (!_running) scanBarResolve(); refreshHistoryPanel(); return; }
+        if (_session.phase === 'sparse') _session.consecMisses = 0;
+        _stop = false;
         await coreScan(_session);
+        if (!_running) scanBarResolve();      /* v8.1: the catch-all */
+        refreshHistoryPanel();
     }
 
     async function restartSearch () {
@@ -4433,10 +6310,14 @@
         ensureSnapshot();
         ul.textContent = '';
         _seenIds = new Set();
+        _gridPage = null;
         setCount(0); setProgress(0);
         setContBar('none', '', '');
         _session = newSession(_session.params);
+        renderJobStrip();
         await startScan(_session);
+        if (!_running) scanBarResolve();      /* v8.1: the catch-all */
+        refreshHistoryPanel();
     }
 
     /* ═══ PANEL UI ═══════════════════════════════════════════════ */
@@ -4501,19 +6382,24 @@
           '</div></div>' +
         '<div class="nx-field"><span class="nx-l">Notify when finished</span>' +
           '<span class="nx-dlchk"><input type="checkbox" id="nx-dlnotif"><span>desktop alert when the queue drains</span></span></div>' +
+        '<div class="nx-field"><span class="nx-l">Floating page button</span>' +
+          '<span class="nx-dlchk"><input type="checkbox" id="nx-pgpill" checked><span>one tap queues every page you have scrolled to load</span></span></div>' +
+        '<div class="nx-field"><span class="nx-l">Page download buttons</span>' +
+          '<span class="nx-dlchk"><input type="checkbox" id="nx-pgbars" checked><span>a download button beside every page number — this page only</span></span></div>' +
       '</div>' +
       '<div class="nx-dlstats" id="nx-dlstats"></div>' +
       '<div class="nx-actrow">' +
         '<button type="button" class="nx-btn nx-btn-go" id="nx-go"></button>' +
-        '<button type="button" class="nx-btn" id="nx-stop2" disabled>Stop</button>' +
+        '<button type="button" class="nx-btn" id="nx-stop2" disabled>Pause</button>' +
         '<button type="button" class="nx-btn" id="nx-restart" disabled>Restart</button>' +
         '<button type="button" class="nx-btn" id="nx-clear">Clear grid</button>' +
         '<button type="button" class="nx-btn" id="nx-fix">Fix thumbs</button>' +
       '</div>' +
+      '<div class="nx-jobstrip" id="nx-jobstrip" hidden></div>' +
       '<div class="nx-sec-h">Search history <span class="nx-hspan">· keep <input id="nx-hm" class="nx-in nx-in-hm" type="number" min="1" step="1"> searches</span></div>' +
       '<div class="nx-hist" id="nx-hist"></div>' +
       '<div class="nx-hist-foot"><button type="button" class="nx-btn nx-btn-dim" id="nx-hist-clear">Clear history</button></div>' +
-      '<div class="nx-foot"><span>naXim Labs · Wallhaven Enhancer v7.5.1</span><a href="https://github.com/0naXim0" target="_blank" rel="noopener">github.com/0naXim0</a></div>' +
+      '<div class="nx-foot"><span>naXim Labs · Wallhaven Enhancer v8.1.0</span><a href="https://github.com/0naXim0" target="_blank" rel="noopener">github.com/0naXim0</a></div>' +
     '</div></div></div>';
 
     function chipsVal (box)   { return Array.prototype.map.call(box.children, c => c.classList.contains('on') ? '1' : '0').join(''); }
@@ -4600,6 +6486,8 @@
     let _cntRaf = false, _cntVal = 0;
     function setCount (n) {
         _cntVal = n || 0;
+        try { PagePill.onCount(_cntVal); } catch (e) {}     /* v7.8.1: the floating page pill counts with the grid */
+        try { PageBar.onCount(_cntVal); } catch (e) {}      /* v7.9: the scan bar's count follows the grid */
         if (_cntRaf || !UI) return;
         _cntRaf = true;
         requestAnimationFrame(() => { _cntRaf = false; if (UI && UI.count) UI.count.textContent = _cntVal.toLocaleString(); });
@@ -4614,6 +6502,16 @@
         const w = Math.max(0, Math.min(100, p || 0));
         UI.progI.style.width = w + '%';
         UI.progI.parentNode.style.opacity = (w > 0 && w < 100) ? '1' : '0';
+    }
+    /* v8.1 — every scan terminal resolves the bar the same way: fill
+       it for a beat, then clear — a completed job never leaves a frozen
+       half-bar on screen. Idempotent within its window, and a fresh
+       scan run always outranks the pending fade. */
+    let _barResT = 0;
+    function scanBarResolve () {
+        setProgress(100);
+        if (_barResT) clearTimeout(_barResT);
+        _barResT = setTimeout(() => { _barResT = 0; if (!_running) setProgress(0); }, 600);
     }
     function setRunningUI (on) {
         if (!UI) return;
@@ -4649,7 +6547,7 @@
                 res: $r('#nx-res'), rat: $r('#nx-rat'), key: $r('#nx-key'), hm: $r('#nx-hm'),
             },
             chips: { cat: $r('#nx-cat'), pur: $r('#nx-pur') },
-            maxon: $r('#nx-maxon'), inf: $r('#nx-inf'),
+            maxon: $r('#nx-maxon'), inf: $r('#nx-inf'), jobstrip: $r('#nx-jobstrip'),
         };
 
         UI.btnSearch.forEach(b => b.innerHTML = IC.play);
@@ -4701,6 +6599,7 @@
         i.maxf.addEventListener('change', normFavs('max'));
 
         i.bs.addEventListener('change', () => set('batchSize', clampInt(i.bs.value, 1, 1000, 200)));
+
         i.res.addEventListener('change', () => set('atleast', i.res.value.trim()));
         i.rat.addEventListener('change', () => set('ratios', i.rat.value.trim()));
         i.key.addEventListener('change', () => set('apiKey', i.key.value.trim()));
@@ -4753,6 +6652,19 @@
         DL.onCfg(paintDl);
         paintDl();
 
+        /* v7.8.1 — the floating page pill: on by default, one tap
+           queues the whole current page through the classic download
+           manager (the pill itself mounts in the init steps). */
+        const pgChk = $r('#nx-pgpill');
+        pgChk.checked = !!get('pagePill');
+        pgChk.addEventListener('change', () => { set('pagePill', pgChk.checked); PagePill.sync(); });
+
+        /* v7.9 — the per-page buttons: a download chip beside every
+           page number; off removes them all live. */
+        const pbChk = $r('#nx-pgbars');
+        pbChk.checked = !!get('pageBars');
+        pbChk.addEventListener('change', () => { set('pageBars', pbChk.checked); PageBar.sync(); });
+
         $r('.nx-presets').addEventListener('click', e => {
             const b = e.target.closest('button[data-p]'); if (b) applyPreset(b.dataset.p);
         });
@@ -4765,7 +6677,10 @@
         });
 
         UI.btnSearch.forEach(b => b.addEventListener('click', runSearch));
-        UI.btnStop.forEach(b => b.addEventListener('click', () => { _stop = true; setStatus('Stopping…'); }));
+        UI.btnStop.forEach(b => b.addEventListener('click', () => {
+            if (_running) pauseSearch();
+            else if (_session && _session.phase === 'paused') continueSearch();
+        }));
         UI.btnRestart.forEach(b => b.addEventListener('click', restartSearch));
         UI.btnClear.forEach(b => b.addEventListener('click', clearGrid));
         UI.btnRefresh.forEach(b => b.addEventListener('click', refreshImages));
@@ -4773,10 +6688,12 @@
             historyLoad().forEach(e => batchDelete(e.id));
             _session = null;
             refreshHistoryPanel();
+            renderJobStrip();
             setStatus('History cleared.');
         });
 
         refreshHistoryPanel();
+        renderJobStrip();
         setCount(document.querySelectorAll('figure.thumb[data-wallpaper-id]').length);
     }
 
@@ -4784,11 +6701,11 @@
 
     const CSS = `
 :root { --nx-acc:#7aa2f7; --nx-ok:#9ece6a; --nx-err:#f7768e; --nx-acc-soft:rgba(122,162,247,.16); }
-:where(.nx-panel, .nx-lb, .nx-hyper-pill, .nx-cont-bar, .nx-dlm) :is(button, a, input, select) {
+:where(.nx-panel, .nx-lb, .nx-hyper-pill, .nx-cont-bar, .nx-dlm, .nx-pg) :is(button, a, input, select) {
     margin:0; padding:0; font:inherit; color:inherit; background:none; border:none;
     box-sizing:border-box; cursor:pointer; text-decoration:none; line-height:1.2;
 }
-:where(.nx-panel, .nx-lb, .nx-hyper-pill, .nx-cont-bar, .nx-dlm) * { box-sizing:border-box; }
+:where(.nx-panel, .nx-lb, .nx-hyper-pill, .nx-cont-bar, .nx-dlm, .nx-pg) * { box-sizing:border-box; }
 :where(.nx-panel, .nx-lb) :is(button, a):focus-visible { outline:2px solid var(--nx-acc); outline-offset:2px; }
 
 #nx-panel {
@@ -4894,7 +6811,6 @@
 .nx-hist-row { display:flex; align-items:center; gap:8px; padding:4px 8px; border:1px solid var(--bd);
     border-radius:8px; background:var(--bg); }
 .nx-hist-label { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:11.5px; }
-.nx-hist-count { font-size:10.5px; color:var(--mut); white-space:nowrap; }
 .nx-hist-empty { color:var(--mut); font-size:11.5px; padding:4px 8px; }
 .nx-hist-x { padding:0 7px; } .nx-hist-x svg { width:11px; height:11px; }
 .nx-hspan { display:inline-flex; align-items:center; gap:6px; text-transform:none;
@@ -4916,6 +6832,40 @@
 .nx-dlchk span { font-size:11.5px; color:var(--mut); }
 .nx-dlstats { padding:0 0 6px; font-size:10.5px; color:var(--mut); }
 .nx-hist-foot { display:flex; justify-content:flex-end; padding-top:4px; }
+.nx-jobstrip { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin:6px 0 2px;
+    padding:6px 9px; background:var(--sf2); border:1px solid var(--bd); border-radius:9px;
+    font-size:11px; color:var(--mut); }
+.nx-jobstrip[hidden] { display:none; }
+.nx-job-txt { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.nx-phase { flex:none; padding:2px 8px; border-radius:99px; background:var(--nx-acc-soft); color:var(--nx-acc);
+    font:600 9.5px/1.4 -apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+    letter-spacing:.4px; text-transform:uppercase; }
+.nx-phase-paused, .nx-phase-sparse, .nx-phase-legacy { background:rgba(224,175,104,.16); color:#e0af68; }
+.nx-phase-collecting { background:rgba(122,162,247,.16); color:#7aa2f7; }
+.nx-phase-exhausted { background:rgba(158,206,106,.14); color:#9ece6a; }
+.nx-phase-error { background:rgba(247,118,142,.15); color:#f7768e; }
+.nx-hist-main { flex:1; min-width:0; display:flex; flex-direction:column; gap:2px; }
+.nx-hist-meta { font-size:10.5px; color:var(--mut); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.nx-hist-btns { display:flex; gap:4px; flex:none; }
+.nx-hist-ib { padding:0 7px; } .nx-hist-ib svg { width:11px; height:11px; }
+.nx-hist-item { display:flex; flex-direction:column; gap:3px; }
+.nx-hist-tw { flex:none; display:inline-flex; align-items:center; gap:4px; height:24px; padding:0 6px;
+    border-radius:7px; color:var(--mut); transition:color .15s, background .15s; }
+.nx-hist-tw:not(:disabled):hover { background:var(--sf2); color:var(--tx); }
+.nx-hist-tw:disabled { opacity:.35; cursor:default; }
+.nx-hist-tw b { font-size:10px; font-weight:700; color:var(--nx-acc); background:var(--nx-acc-soft);
+    padding:1px 6px; border-radius:99px; line-height:1.4; }
+.nx-hist-tw svg { width:11px; height:11px; transition:transform .18s; }
+.nx-hist-item.nx-open > .nx-hist-row .nx-hist-tw svg { transform:rotate(180deg); }
+.nx-hist-sub { display:flex; flex-direction:column; gap:3px; margin-left:24px; padding:1px 0 1px 9px;
+    border-left:2px solid var(--bd); }
+.nx-hist-sub[hidden] { display:none; }
+.nx-hist-batch { display:flex; align-items:center; gap:8px; padding:3px 8px; border:1px solid var(--bd);
+    border-radius:7px; background:var(--sf); }
+.nx-hist-batch-n { flex:none; min-width:36px; font-size:11px; font-weight:700; color:var(--nx-acc); }
+.nx-hist-batch-meta { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    font-size:10.5px; color:var(--mut); }
+.nx-hist-batch .nx-btn { flex:none; height:22px; padding:0 9px; font-size:10.5px; }
 .nx-foot { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:6px;
     padding:8px 0 2px; margin-top:8px; border-top:1px solid var(--bd);
     font-size:10.5px; color:var(--mut); }
@@ -5188,12 +7138,20 @@ figure.thumb.nx-flash { animation:nx-flash .55s ease; }
     .nx-dlm-rows { max-height:170px; }
 }
 
-.nx-cont-bar { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin:12px 0;
-    padding:10px 12px; border:1px solid #2a2f3a; border-radius:12px;
-    background:rgba(25,28,35,.92); backdrop-filter:blur(8px);
-    box-shadow:0 6px 20px rgba(0,0,0,.35); font-family:-apple-system,"Segoe UI",Roboto,sans-serif; }
-.nx-cont-bar .nx-btn { min-width:170px; justify-content:center;
+/* ─── v7.7.1 floating Continue pill — always on screen ─── */
+.nx-cont-bar { position:fixed; left:50%; bottom:18px; z-index:30400;
+    display:flex; align-items:center; gap:10px; max-width:min(92vw, 640px);
+    padding:5px; border:1px solid #2a2f3a; border-radius:999px;
+    background:rgba(25,28,35,.92); backdrop-filter:blur(10px);
+    box-shadow:0 10px 32px rgba(0,0,0,.45), 0 2px 8px rgba(0,0,0,.28);
+    font-family:-apple-system,"Segoe UI",Roboto,sans-serif;
+    opacity:0; transform:translate(-50%, 10px); pointer-events:none;
+    transition:opacity .18s ease, transform .18s ease; }
+.nx-cont-bar.on { opacity:1; transform:translate(-50%, 0); pointer-events:auto; }
+.nx-cont-bar .nx-btn { flex:none; height:34px; min-width:0; padding:0 16px;
+    border-radius:999px; justify-content:center; white-space:nowrap; cursor:pointer;
     background:#7aa2f7; border:1px solid #7aa2f7; color:#0c0e13;
+    font-size:12.5px; font-weight:600;
     box-shadow:0 3px 12px rgba(122,162,247,.35);
     transition:background .15s, border-color .15s, transform .15s, box-shadow .15s; }
 .nx-cont-bar .nx-btn svg { color:#0c0e13; }
@@ -5207,7 +7165,25 @@ figure.thumb.nx-flash { animation:nx-flash .55s ease; }
 .nx-cont-bar .nx-btn.nx-loading svg { color:#7aa2f7; animation:nx-rot 1s linear infinite; }
 .nx-cont-bar.nx-done .nx-btn { background:transparent; border-color:#2a2f3a; color:#8d93a3; box-shadow:none; opacity:1; }
 .nx-cont-bar.nx-done .nx-btn svg { color:#8d93a3; }
-.nx-cont-note { font-size:11.5px; color:#8d93a3; }
+.nx-cont-note { min-width:0; max-width:340px; padding-right:10px; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; font-size:11.5px; color:#8d93a3; }
+.nx-cont-note[hidden] { display:none; }
+/* v8.1 — Back & Forward ride the same pill, visually quiet: they
+   return to SAVED pages, they never drive the live session. */
+.nx-cont-bar .nx-back-btn, .nx-cont-bar .nx-fwd-btn { background:#2b313d; border-color:#3a4150; color:#c2cad8; box-shadow:none; }
+.nx-cont-bar .nx-back-btn svg, .nx-cont-bar .nx-fwd-btn svg { color:#c2cad8; }
+.nx-cont-bar .nx-back-btn:hover:not(:disabled), .nx-cont-bar .nx-fwd-btn:hover:not(:disabled) { background:#353d4c; border-color:#4a5470;
+    transform:translateY(-1px); box-shadow:0 4px 14px rgba(0,0,0,.35); }
+.nx-cont-bar .nx-back-btn:disabled, .nx-cont-bar .nx-fwd-btn:disabled { background:#242933; border-color:#242933; color:#6d7484; opacity:1; }
+.nx-cont-bar .nx-back-btn[hidden], .nx-cont-bar .nx-fwd-btn[hidden] { display:none; }
+.nx-cont-bar.nx-done .nx-back-btn, .nx-cont-bar.nx-done .nx-fwd-btn { display:none; }   /* a finished job has nowhere to go back or forward to */
+@media (max-width:760px) {
+    .nx-cont-bar { left:12px; right:66px; bottom:12px; transform:translateY(10px); max-width:none; }
+    .nx-cont-bar.on { transform:none; }
+    .nx-cont-note { display:none !important; }
+    .nx-cont-bar .nx-back-btn, .nx-cont-bar .nx-fwd-btn { width:34px; padding:0; }      /* v8.1: icon-only on phones — the pill stays compact */
+    .nx-cont-bar .nx-back-btn span, .nx-cont-bar .nx-fwd-btn span { display:none; }
+}
 
 .nx-lb { position:fixed; inset:0; z-index:31000; font-family:-apple-system,"Segoe UI",Roboto,sans-serif; }
 .nx-lb-bg { position:absolute; inset:0; background:rgba(7,9,13,.88); backdrop-filter:blur(16px) saturate(1.1); }
@@ -5241,12 +7217,19 @@ figure.thumb.nx-flash { animation:nx-flash .55s ease; }
 .nx-lb-ab.nx-on .nx-hd-prog i { background:var(--nx-ok); }
 .nx-hd-prog.nx-indet i { width:30%; animation:nx-hdslide 1.15s ease-in-out infinite; }
 @keyframes nx-hdslide { 0% { transform:translateX(-105%); } 100% { transform:translateX(330%); } }
+/* v8.1 — the RENDERING phase: the blob has landed and the bitmap is
+   decoding; a green shimmer, distinct from the blue download bar, so
+   a full bar never reads as stuck. */
+.nx-lb-ab.nx-proc .nx-hd-prog i { background:var(--nx-ok); }
 .nx-lb-stage { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
     padding:64px 70px 46px; touch-action:none; }
 .nx-lb-stage.nx-pannable { cursor:grab; }
 .nx-lb-stage.nx-grabbing { cursor:grabbing; }
 .nx-lb-img { max-width:100%; max-height:100%; object-fit:contain; border-radius:3px;
     box-shadow:0 18px 70px rgba(0,0,0,.55); user-select:none; -webkit-user-drag:none; will-change:transform; }
+/* v7.9.1 — the HD layer lives at its TRUE natural pixel size so the decode is never
+   clamped to a small box; the transform fits it. max-* must not fight that. */
+.nx-lb-img.nx-lb-hdnat { max-width:none; max-height:none; object-fit:fill; }
 .nx-lb-img.nx-off { display:none; }
 .nx-lb-img.nx-anim { transition:transform .26s cubic-bezier(.22,.8,.3,1); }
 .nx-lb-img.nx-lb-ph { filter:blur(14px) brightness(.72) saturate(1.15); transform:scale(1.04); box-shadow:none; }
@@ -5270,6 +7253,7 @@ figure.thumb.nx-flash { animation:nx-flash .55s ease; }
 .nx-zc button svg { width:15px; height:15px; }
 .nx-zc button:hover { background:rgba(30,35,46,.85); }
 .nx-zc button:disabled { opacity:.3; cursor:default; }
+.nx-zc-11 { font-size:10.5px; font-weight:700; letter-spacing:.04em; }
 .nx-lb-arr { position:absolute; top:50%; transform:translateY(-50%); z-index:4; width:46px; height:46px;
     border-radius:50%; border:1px solid rgba(255,255,255,.12); background:rgba(18,21,28,.6);
     color:#e8ecf4; display:flex; align-items:center; justify-content:center;
@@ -5310,9 +7294,14 @@ figure.thumb.nx-flash { animation:nx-flash .55s ease; }
     .nx-tool.nx-pulse, .nx-lb-ab.nx-pulse, .nx-fav.nx-pulse { animation:none !important; }
     .nx-fav::after, .nx-fav svg { transition:none !important; animation:none !important; }
     .nx-dlm { transition:none !important; }
+    .nx-cont-bar { transition:none !important; }
     .nx-dlm-ring .nx-r-fg, .nx-dlm-rring .nx-r-fg { transition:none !important; }
     .nx-dlm-act, .nx-stp { transition:none !important; }
     .nx-dlm.nx-open .nx-dlm-list { animation:none !important; }
+    .nx-pg { transition:none !important; }
+    .nx-pg.nx-pg-ok { animation:none !important; }
+    .nx-pb { transition:none !important; }
+    .nx-pb.nx-pb-ok { animation:none !important; }
 }
 #nx-fav-notice{position:fixed;right:22px;bottom:22px;z-index:2147483647;max-width:360px;padding:12px 16px;border:1px solid rgba(255,255,255,.16);border-radius:12px;background:rgba(18,22,30,.97);box-shadow:0 12px 34px rgba(0,0,0,.42);color:#eef3fb;font:600 13px/1.35 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;opacity:0;transform:translateY(10px);pointer-events:none;transition:opacity .18s,transform .18s}#nx-fav-notice.show{opacity:1;transform:none}#nx-fav-notice[data-kind="ok"]{border-color:rgba(125,220,160,.5)}#nx-fav-notice[data-kind="error"]{border-color:rgba(244,120,140,.6)}
 /* ─── Collection picker (rendered inside wallhaven's #overlay) ───
@@ -5364,6 +7353,45 @@ figure.thumb.nx-flash { animation:nx-flash .55s ease; }
 .nx-picker-retry{display:inline-flex;align-items:center;height:30px;padding:0 14px;border-radius:9px;border:1px solid rgba(255,255,255,.18);background:rgba(255,255,255,.06);color:#e8edf6;font-size:12px;font-weight:700;cursor:pointer;transition:background .15s,border-color .15s}
 .nx-picker-retry:hover{background:rgba(255,255,255,.1);border-color:rgba(255,255,255,.3)}
 .nx-picker-retry:focus-visible{outline:2px solid rgba(122,162,247,.85);outline-offset:1px}
+
+/* ─── v7.8.1 — floating page pill (one tap = the whole page) ──── */
+.nx-pg { position:fixed; left:16px; bottom:16px; z-index:30400; display:inline-flex; align-items:center; gap:7px;
+    height:36px; padding:0 15px 0 13px; border:1px solid #2a2f3a; border-radius:99px;
+    background:rgba(25,28,35,.92); backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
+    box-shadow:0 10px 28px rgba(0,0,0,.45); color:#e8ecf4; cursor:pointer;
+    font:600 12px/1 -apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+    opacity:0; transform:translateY(10px); pointer-events:none;
+    transition:opacity .18s, transform .18s, background .15s, border-color .15s; }
+.nx-pg.on { opacity:1; transform:none; pointer-events:auto; }
+.nx-pg:hover { background:rgba(34,38,48,.96); border-color:#3a4152; }
+.nx-pg:active { transform:translateY(1px); }
+.nx-pg:focus-visible { outline:2px solid rgba(122,162,247,.85); outline-offset:2px; }
+.nx-pg-i { display:flex; flex:none; color:#7aa2f7; }
+.nx-pg-i svg { width:14px; height:14px; }
+.nx-pg-n { letter-spacing:.2px; }
+.nx-pg-t { font-size:11px; font-weight:500; color:#8d93a3; white-space:nowrap; }
+.nx-pg-t:empty { display:none; }
+.nx-pg.nx-pg-ok { animation:nx-pg-ok .8s ease; }
+@keyframes nx-pg-ok { 0% { background:#7aa2f7; border-color:#7aa2f7; } }
+@media (max-width:760px) { .nx-pg { left:12px; bottom:62px; height:32px; padding:0 13px 0 11px; } }
+
+/* ─── v7.9.0 page bars — a download chip beside every page number ─── */
+.nx-pb { order:15; -ms-flex-order:15; display:inline-flex; align-items:center; gap:6px; height:28px;
+    margin:0 0 .45em 14px; padding:0 12px 0 10px; box-sizing:border-box; border:1px solid #2a2f3a; border-radius:99px;
+    background:rgba(25,28,35,.92); backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px);
+    color:#e8ecf4; cursor:pointer; vertical-align:middle;
+    font:600 12px/1 -apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+    transition:background .15s, border-color .15s, transform .12s; }
+.nx-pb:hover { background:rgba(34,38,48,.96); border-color:#3a4152; }
+.nx-pb:active { transform:translateY(1px); }
+.nx-pb:focus-visible { outline:2px solid rgba(122,162,247,.85); outline-offset:2px; }
+.nx-pb-i { display:flex; flex:none; color:#7aa2f7; }
+.nx-pb-i svg { width:12px; height:12px; }
+.nx-pb-n { letter-spacing:.2px; }
+.nx-pb.nx-pb-ok { animation:nx-pg-ok .8s ease; }
+section.thumb-listing-page.nx-scanmode > header.thumb-listing-page-header:not(.nx-ownbar) { display:none !important; }
+header.nx-ownbar[hidden] { display:none !important; }
+@media (max-width:760px) { .nx-pb { height:26px; margin-left:10px; padding:0 10px 0 9px; } }
 `;
 
     const addCss = css => {
@@ -5385,6 +7413,8 @@ figure.thumb.nx-flash { animation:nx-flash .55s ease; }
      * (first scan card, picker open, or a removal that needs it). */
     step('favIndex', () => { if (FavState.hasCache()) FavState.ensureIndexSoon(5000); });
     step('dlQueue',  () => { DL.boot(); });
+    step('pageBars', () => PageBar.boot());
+    step('pagePill', () => PagePill.boot());
     step('status',   () => setStatus('Ready · hover a card, then click the eye for an instant preview'));
     console.info('[naXim Labs] initialized');
 })();
