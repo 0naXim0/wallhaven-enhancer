@@ -1,6 +1,6 @@
 # Wallhaven Enhancer
 
-The final stable Tampermonkey userscript by **naXim Labs** (v8.1.0) that makes Wallhaven galleries faster to explore. It adds instant full-resolution previews, wallpaper metadata, direct original-file downloads, batch wallpaper and batch page downloads, and keyboard browsing without replacing Wallhaven’s native pages.
+The final stable Tampermonkey userscript by **naXim Labs** (v8.1.0) that makes Wallhaven galleries faster to explore. It adds instant full-resolution previews, wallpaper metadata, direct original-file downloads, batch wallpaper and batch page downloads, own internal downloading manager consistent downloads even with page refresh and keyboard browsing without replacing Wallhaven’s native pages.
 
 ## Features
 
